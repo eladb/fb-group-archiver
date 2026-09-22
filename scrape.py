@@ -50,6 +50,10 @@ DEFAULT_EXPAND = (
     r"|עוד\s+תגובות|הצג\s+עוד\s+תגובות"
 )
 
+# How long `login` watches a remote browser for a hand-driven login when there
+# is no terminal to press Enter at.
+DEFAULT_LOGIN_WAIT = 900
+
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -265,7 +269,28 @@ def drain_media(ctx, store: Store, limit: int = 25) -> int:
 
 # ---------------------------------------------------------------- commands
 
+def wait_for_login(sess, seconds: int, poll: float = 5.0) -> bool:
+    """Poll the remote browser's cookies until someone logs in over there.
+
+    The alternative -- blocking on Enter -- assumes whoever runs the CLI is also
+    the one clicking through the login. With a remote browser they are often
+    not: the crawl is driven from a sandbox while the human is in a browser tab
+    somewhere else, with no terminal to press Enter at.
+    """
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if is_logged_in(sess.ctx):
+            return True
+        time.sleep(poll)
+        remaining = int(deadline - time.time())
+        if remaining >= 60 and remaining % 60 < poll:
+            log(f"still waiting for the login ({remaining // 60} min left)")
+    return is_logged_in(sess.ctx)
+
+
 def cmd_login(args) -> None:
+    # No terminal to press Enter at means polling is the only thing that works.
+    wait = args.wait or (0 if sys.stdin.isatty() else DEFAULT_LOGIN_WAIT)
     sess = open_browser(args, headless=False)
     ctx = sess.ctx
     try:
@@ -278,18 +303,22 @@ def cmd_login(args) -> None:
                 f"  browser -- keep it to yourself):\n\n    {sess.remote.view_url}\n"
                 "\n  Complete any 2FA and dismiss the cookie banner. The session is\n"
                 "  kept in the remote profile and reused by every later `crawl`.\n"
-                "\n  Press Enter here once you're logged in..."
             )
         else:
             print(
                 "\n  A Chrome window is open. Log into Facebook there by hand,\n"
                 "  complete any 2FA, and dismiss the cookie banner.\n"
                 "  The session is saved to the profile directory and reused by `crawl`.\n"
-                "\n  Press Enter here once you're logged in..."
             )
-        input()
-        if is_logged_in(ctx):
-            log("Session saved. You can close the browser.")
+        if wait:
+            log(f"watching for the login for up to {wait // 60} min")
+            ok = wait_for_login(sess, wait)
+        else:
+            print("  Press Enter here once you're logged in...")
+            input()
+            ok = is_logged_in(ctx)
+        if ok:
+            log("logged in -- session saved. You can close the browser.")
         else:
             log("WARNING: no c_user cookie found -- login may not have completed.")
     finally:
@@ -599,6 +628,9 @@ def main():
         p.add_argument("--no-media", dest="media", action="store_false")
 
     p = sub.add_parser("login", help="open Chrome so you can log in by hand (run once)")
+    p.add_argument("--wait", type=int, default=0,
+                   help="watch for the login for N seconds instead of waiting on Enter "
+                        f"(automatic, {DEFAULT_LOGIN_WAIT}s, when stdin is not a terminal)")
     p.set_defaults(func=cmd_login)
 
     p = sub.add_parser("crawl", help="sweep the group feed")

@@ -99,6 +99,11 @@ What changes in this mode:
 - **Cookies live on the box, not in `.chrome-profile/`.** `login` is still a
   one-time manual step, but you do it in the box's browser through the token's
   watch URL (noVNC in a browser tab). The session then outlives every run.
+- **`login` watches instead of blocking.** Whoever clicks through the login is
+  often not whoever ran the command — the crawl is driven from a sandbox, the
+  human is in a browser tab with no terminal to press Enter at. So when stdin
+  isn't a terminal, `login` polls for the cookie for 15 minutes rather than
+  waiting on Enter; `--wait N` sets that explicitly.
 - **Page traffic comes from the box's IP** — one consistent location for one
   account, instead of a session that hops networks between runs. Media downloads
   are the exception: Playwright issues those from the driver process (wherever
