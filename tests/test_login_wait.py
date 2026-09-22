@@ -70,3 +70,22 @@ class TestWaitForLogin:
     def test_zero_budget_still_checks_once(self, no_sleep):
         ctx = FakeContext(appears_after=0)
         assert scrape.wait_for_login(FakeSession(ctx), seconds=0) is True
+
+
+class TestCountdown:
+    """A long wait has to look alive, and it has to count down honestly."""
+
+    def test_one_notice_per_minute(self, no_sleep, capsys):
+        """Each pass costs a little over `poll`, which is what a modulo window
+        steps over -- 5 minutes of waiting must still print 4 notices."""
+        scrape.wait_for_login(FakeSession(FakeContext()), seconds=300, poll=5.2)
+        notices = [ln for ln in capsys.readouterr().out.splitlines() if "still waiting" in ln]
+        assert len(notices) == 4
+
+    def test_counts_down_without_overstating_what_is_left(self, no_sleep, capsys):
+        """Rounded up, so 3m58s reads as 4 min rather than 3 -- and the last
+        stretch says so plainly instead of claiming a whole minute."""
+        scrape.wait_for_login(FakeSession(FakeContext()), seconds=300, poll=5.2)
+        notices = [ln.split("(")[1] for ln in capsys.readouterr().out.splitlines()
+                   if "still waiting" in ln]
+        assert notices == ["4 min left)", "3 min left)", "2 min left)", "under a min left)"]

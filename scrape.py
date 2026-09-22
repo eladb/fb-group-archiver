@@ -17,6 +17,7 @@ browserbase.py).
 
 import argparse
 import json
+import math
 import random
 import re
 import sys
@@ -278,13 +279,22 @@ def wait_for_login(sess, seconds: int, poll: float = 5.0) -> bool:
     somewhere else, with no terminal to press Enter at.
     """
     deadline = time.time() + seconds
+    # Count down from a moving mark rather than on `remaining % 60`: each pass
+    # costs a shade more than `poll` (the cookie read), so a modulo window gets
+    # stepped over and the countdown skips minutes.
+    next_notice = seconds - 60
     while time.time() < deadline:
         if is_logged_in(sess.ctx):
             return True
         time.sleep(poll)
-        remaining = int(deadline - time.time())
-        if remaining >= 60 and remaining % 60 < poll:
-            log(f"still waiting for the login ({remaining // 60} min left)")
+        remaining = deadline - time.time()
+        if remaining <= next_notice and remaining > poll:
+            # Round up: with 3m58s left, "3 min" reads as less time than there
+            # is, and someone mid-2FA is watching this line to decide whether
+            # they have to hurry.
+            left = f"{math.ceil(remaining / 60)} min" if remaining >= 60 else "under a min"
+            log(f"still waiting for the login ({left} left)")
+            next_notice = remaining - 60
     return is_logged_in(sess.ctx)
 
 
