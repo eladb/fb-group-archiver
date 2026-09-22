@@ -144,6 +144,39 @@ def is_actor_node(d) -> bool:
 
 # ---- field extraction ------------------------------------------------
 
+def _redact_mentions(body):
+    """Body text with @-mentions replaced by the mentioned person's handle.
+
+    Pseudonymizing the author columns is not enough: Facebook renders a reply's
+    @-mention as ordinary text at the start of the comment body, so a corpus
+    with no author_name still opens ~38% of its replies with a real person's
+    full name. The payload marks each mention as an EntityAtRange
+    (offset/length/entity), so the span can be replaced exactly -- keeping the
+    conversational structure ("anon:x thank you") while removing the name, and
+    reusing the same handle the mentioned person has as an author elsewhere.
+    """
+    if not isinstance(body, dict):
+        return None
+    text = body.get("text")
+    if not isinstance(text, str) or not text:
+        return text if isinstance(text, str) else None
+    if not PSEUDONYMIZE:
+        return text
+    ranges = [r for r in (body.get("ranges") or []) if isinstance(r, dict)]
+    # Right to left, so replacing one span cannot invalidate an earlier offset.
+    for r in sorted(ranges, key=lambda r: r.get("offset") or 0, reverse=True):
+        off, ln = r.get("offset"), r.get("length")
+        if not isinstance(off, int) or not isinstance(ln, int) or ln <= 0:
+            continue
+        if off < 0 or off + ln > len(text):
+            continue
+        entity = r.get("entity") if isinstance(r.get("entity"), dict) else {}
+        handle, _ = pseudonymize(entity.get("id"), text[off:off + ln])
+        if handle:
+            text = text[:off] + handle + text[off + ln:]
+    return text
+
+
 def _text(node):
     """Post body text. Prefer the story message; fall back to any message.text."""
     for path in (
@@ -295,7 +328,7 @@ def normalize_comment(node, post_id=None, raw_ref=None):
     if not isinstance(cid, str) or not cid:
         return None
     author_id, author_name = pseudonymize(*_actor(node))
-    body = dig(node, "body", "text")
+    body = _redact_mentions(node.get("body"))
     if not isinstance(body, str):
         body = None
     # Replies name their parent under comment_direct_parent; the older

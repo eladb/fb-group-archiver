@@ -59,3 +59,48 @@ class TestPseudonymize:
         p = extract.normalize_post(node)
         assert p["text"] == node["message"]["text"]
         assert p["reaction_count"] == 12
+
+
+class TestMentionRedaction:
+    """@-mentions render as plain text in the body, carrying real names."""
+
+    def _comment(self, text, ranges):
+        return {"__typename": "Comment", "id": "c1", "created_time": 1,
+                "body": {"text": text, "ranges": ranges},
+                "author": {"__typename": "User", "id": "7", "name": "Someone"}}
+
+    def test_mention_span_is_replaced_with_a_handle(self, pseudonymous):
+        node = self._comment("Dana Cohen thank you so much", [
+            {"offset": 0, "length": 10, "entity": {"__typename": "User", "id": "555"}}])
+        out = extract.normalize_comment(node)["text"]
+        assert "Dana Cohen" not in out
+        assert out.startswith("anon:")
+        assert out.endswith(" thank you so much")
+
+    def test_handle_matches_that_persons_author_handle(self, pseudonymous):
+        mentioned, _ = extract.pseudonymize("555", "Dana Cohen")
+        node = self._comment("Dana Cohen hi", [
+            {"offset": 0, "length": 10, "entity": {"id": "555"}}])
+        assert extract.normalize_comment(node)["text"].startswith(mentioned)
+
+    def test_multiple_mentions_all_replaced(self, pseudonymous):
+        node = self._comment("Ann Lee and Bo Ray both helped", [
+            {"offset": 0, "length": 7, "entity": {"id": "1"}},
+            {"offset": 12, "length": 6, "entity": {"id": "2"}}])
+        out = extract.normalize_comment(node)["text"]
+        assert "Ann Lee" not in out and "Bo Ray" not in out
+        assert "both helped" in out
+
+    def test_body_without_ranges_is_untouched(self, pseudonymous):
+        node = self._comment("no mentions here", [])
+        assert extract.normalize_comment(node)["text"] == "no mentions here"
+
+    def test_out_of_bounds_range_is_ignored_not_crashed(self, pseudonymous):
+        node = self._comment("short", [{"offset": 0, "length": 999, "entity": {"id": "1"}}])
+        assert extract.normalize_comment(node)["text"] == "short"
+
+    def test_disabled_pseudonymization_leaves_names_intact(self, monkeypatch):
+        monkeypatch.setattr(extract, "PSEUDONYMIZE", False)
+        node = self._comment("Dana Cohen thanks", [
+            {"offset": 0, "length": 10, "entity": {"id": "555"}}])
+        assert extract.normalize_comment(node)["text"] == "Dana Cohen thanks"
