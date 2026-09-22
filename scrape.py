@@ -7,6 +7,10 @@ truncates it), reaction breakdowns, timestamps and CDN URLs, and it survives UI
 rewrites that break selector-based scrapers.
 
 Nothing leaves your machine. Run `login` once, then `crawl`.
+
+The browser can also be a Sidekick box you own -- a remote Chromium that keeps
+its Facebook session between runs, which is what makes this usable from a
+sandbox. Set SIDEKICK_TOKEN and it is used automatically; see sidekick.py.
 """
 
 import argparse
@@ -23,6 +27,7 @@ try:
 except ImportError:  # keeps parsing/storage importable (and testable) without a browser
     sync_playwright = None
 
+import sidekick
 from extract import harvest, typename_census
 from store import Store
 
@@ -53,19 +58,70 @@ def jitter(lo: float, hi: float) -> float:
 
 # ---------------------------------------------------------------- browser
 
-def open_browser(profile: Path, headless: bool = False):
-    """A persistent real-Chrome profile: stable fingerprint, session survives runs."""
+class BrowserSession:
+    """A browser to drive: the local Chrome profile, or a Sidekick box's.
+
+    One surface for both. The difference that matters is teardown -- a local
+    context is ours to close, while the remote one belongs to the box and has to
+    outlive the run, because it *is* the logged-in profile.
+    """
+
+    def __init__(self, pw, ctx, remote=None):
+        self.pw = pw
+        self.ctx = ctx
+        self.remote = remote  # a sidekick.Sidekick, or None when local
+
+    def page(self):
+        return self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
+
+    def close(self) -> None:
+        if self.remote is None:
+            self.ctx.close()
+        # Remote: stopping the driver drops the CDP connection and leaves the
+        # box's browser, its tabs and its cookies exactly as they were.
+        self.pw.stop()
+
+
+def open_browser(args, headless: bool = None) -> BrowserSession:
+    """A persistent real-Chrome profile: stable fingerprint, session survives runs.
+
+    Remotely that profile lives on a Sidekick box (see sidekick.py) and survives
+    this process entirely, which is the only way a sandboxed run gets a Facebook
+    session at all. Locally it is a directory.
+    """
     if sync_playwright is None:
         sys.exit("playwright is not installed -- see README.md")
+    try:
+        remote = None if getattr(args, "local", False) else sidekick.load(
+            required=getattr(args, "sidekick", False)
+        )
+    except sidekick.SidekickError as exc:
+        sys.exit(f"sidekick: {exc}")
+
     pw = sync_playwright().start()
-    ctx = pw.chromium.launch_persistent_context(
-        user_data_dir=str(profile),
-        channel="chrome",
-        headless=headless,
-        viewport={"width": 1280, "height": 900},
-        args=["--disable-blink-features=AutomationControlled"],
-    )
-    return pw, ctx
+    try:
+        if remote is not None:
+            log(remote.describe())
+            remote.version()  # fail fast, and legibly, on a box that is gone
+            _, ctx = remote.connect(pw)
+            log("attached to the sidekick browser over CDP")
+            if headless or getattr(args, "headless", False):
+                log("note: --headless is ignored on a sidekick box (it runs headful)")
+            return BrowserSession(pw, ctx, remote)
+        ctx = pw.chromium.launch_persistent_context(
+            user_data_dir=str(Path(args.profile)),
+            channel="chrome",
+            headless=getattr(args, "headless", False) if headless is None else headless,
+            viewport={"width": 1280, "height": 900},
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        return BrowserSession(pw, ctx)
+    except sidekick.SidekickError as exc:
+        pw.stop()
+        sys.exit(f"sidekick: {exc}")
+    except Exception:
+        pw.stop()
+        raise
 
 
 def is_logged_in(ctx) -> bool:
@@ -153,7 +209,13 @@ def ext_for(url: str, content_type: str) -> str:
 
 
 def drain_media(ctx, store: Store, limit: int = 25) -> int:
-    """Download queued CDN assets. Signed URLs expire in hours -- do this inline."""
+    """Download queued CDN assets. Signed URLs expire in hours -- do this inline.
+
+    The fetch carries the context's cookies but is issued by the Playwright
+    driver rather than from inside the browser, so against a sidekick box it
+    leaves from this machine, not the box. Signed CDN URLs are not IP-bound, so
+    it works either way.
+    """
     saved = 0
     for row in store.pending_media(limit):
         url = row["src_url"]
@@ -176,22 +238,34 @@ def drain_media(ctx, store: Store, limit: int = 25) -> int:
 # ---------------------------------------------------------------- commands
 
 def cmd_login(args) -> None:
-    pw, ctx = open_browser(Path(args.profile), headless=False)
-    page = ctx.pages[0] if ctx.pages else ctx.new_page()
-    page.goto("https://www.facebook.com/", wait_until="domcontentloaded")
-    print(
-        "\n  A Chrome window is open. Log into Facebook there by hand,\n"
-        "  complete any 2FA, and dismiss the cookie banner.\n"
-        "  The session is saved to the profile directory and reused by `crawl`.\n"
-        "\n  Press Enter here once you're logged in..."
-    )
-    input()
-    if is_logged_in(ctx):
-        log("Session saved. You can close the browser.")
-    else:
-        log("WARNING: no c_user cookie found -- login may not have completed.")
-    ctx.close()
-    pw.stop()
+    sess = open_browser(args, headless=False)
+    ctx = sess.ctx
+    try:
+        page = sess.page()
+        page.goto("https://www.facebook.com/", wait_until="domcontentloaded")
+        if sess.remote is not None:
+            print(
+                "\n  Facebook is open in the sidekick browser. Watch it and click\n"
+                "  through the login here (the URL carries your token -- keep it\n"
+                f"  to yourself):\n\n    {sess.remote.watch_url}\n"
+                "\n  Complete any 2FA and dismiss the cookie banner. The session\n"
+                "  stays on the box and is reused by every later `crawl`.\n"
+                "\n  Press Enter here once you're logged in..."
+            )
+        else:
+            print(
+                "\n  A Chrome window is open. Log into Facebook there by hand,\n"
+                "  complete any 2FA, and dismiss the cookie banner.\n"
+                "  The session is saved to the profile directory and reused by `crawl`.\n"
+                "\n  Press Enter here once you're logged in..."
+            )
+        input()
+        if is_logged_in(ctx):
+            log("Session saved. You can close the browser.")
+        else:
+            log("WARNING: no c_user cookie found -- login may not have completed.")
+    finally:
+        sess.close()
 
 
 def resolve_group(page, url: str) -> str:
@@ -209,11 +283,12 @@ def resolve_group(page, url: str) -> str:
 
 def cmd_crawl(args) -> None:
     store = Store(Path(args.out))
-    pw, ctx = open_browser(Path(args.profile), headless=args.headless)
+    sess = open_browser(args)
+    ctx = sess.ctx
     try:
         if not is_logged_in(ctx):
             raise SystemExit("Not logged in. Run `scrape.py login` first.")
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page = sess.page()
         capture = Capture()
         capture.attach(page)
 
@@ -271,20 +346,20 @@ def cmd_crawl(args) -> None:
         log(f"done: {store.counts()}")
     finally:
         store.close()
-        ctx.close()
-        pw.stop()
+        sess.close()
 
 
 def cmd_comments(args) -> None:
     """Second pass: open each post permalink and expand its comment threads."""
     store = Store(Path(args.out))
-    pw, ctx = open_browser(Path(args.profile), headless=args.headless)
+    sess = open_browser(args)
+    ctx = sess.ctx
     expand_re = re.compile(args.expand_pattern, re.I)
     try:
         if not is_logged_in(ctx):
             raise SystemExit("Not logged in. Run `scrape.py login` first.")
         group_id = store.get_state("group_id")
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page = sess.page()
         capture = Capture()
         capture.attach(page)
 
@@ -335,18 +410,17 @@ def cmd_comments(args) -> None:
         log(f"done: {store.counts()}")
     finally:
         store.close()
-        ctx.close()
-        pw.stop()
+        sess.close()
 
 
 def cmd_media(args) -> None:
     """Drain the media queue on its own (e.g. after an interrupted crawl)."""
     store = Store(Path(args.out))
-    pw, ctx = open_browser(Path(args.profile), headless=args.headless)
+    sess = open_browser(args)
     try:
         total = 0
         while True:
-            n = drain_media(ctx, store, limit=50)
+            n = drain_media(sess.ctx, store, limit=50)
             if not n:
                 break
             total += n
@@ -354,8 +428,7 @@ def cmd_media(args) -> None:
         log(f"done: {store.counts()}")
     finally:
         store.close()
-        ctx.close()
-        pw.stop()
+        sess.close()
 
 
 def cmd_reparse(args) -> None:
@@ -418,6 +491,30 @@ def cmd_export(args) -> None:
     store.close()
 
 
+def cmd_sidekick(args) -> None:
+    """Is the box up, and is its browser still logged into Facebook?"""
+    try:
+        sk = sidekick.load(required=True)
+    except sidekick.SidekickError as exc:
+        raise SystemExit(f"sidekick: {exc}")
+    try:
+        version = sk.version()
+    except sidekick.SidekickError as exc:
+        raise SystemExit(f"sidekick: {exc}")
+    log(f"{sk.host} is reachable: {version.get('Browser', 'unknown browser')}")
+    if sk.watch_url:
+        print(f"  watch: {sk.watch_url}")
+    if sync_playwright is None:
+        log("playwright is not installed, so the login check is skipped")
+        return
+    sess = open_browser(args)
+    try:
+        log("logged into Facebook" if is_logged_in(sess.ctx)
+            else "NOT logged in -- run `scrape.py login`")
+    finally:
+        sess.close()
+
+
 def cmd_status(args) -> None:
     store = Store(Path(args.out))
     counts = store.counts()
@@ -439,6 +536,11 @@ def main():
     ap.add_argument("--out", default="archive", help="output directory (default: archive)")
     ap.add_argument("--profile", default=".chrome-profile",
                     help="persistent Chrome profile dir (default: .chrome-profile)")
+    ap.add_argument("--sidekick", action="store_true",
+                    help="require the remote Sidekick browser (used automatically "
+                         "whenever SIDEKICK_TOKEN is set)")
+    ap.add_argument("--local", action="store_true",
+                    help="force the local Chrome profile, ignoring SIDEKICK_TOKEN")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def add_common(p, media_default=True):
@@ -473,6 +575,10 @@ def main():
     p = sub.add_parser("media", help="download any queued media")
     add_common(p)
     p.set_defaults(func=cmd_media)
+
+    p = sub.add_parser("sidekick", help="check the Sidekick box and its Facebook session")
+    add_common(p)
+    p.set_defaults(func=cmd_sidekick, sidekick=True)
 
     for name, fn, helptext in (
         ("reparse", cmd_reparse, "re-normalize raw captures after a schema change"),

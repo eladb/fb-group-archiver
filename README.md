@@ -58,6 +58,52 @@ Useful flags:
 | `--delay-min/--delay-max` | scroll pacing in seconds (default 2.5–6.0) |
 | `--expand-pattern` | regex for "view more comments" in your UI language |
 
+## Driving a remote browser (Sidekick)
+
+The hard requirement here is a Chrome profile that stays logged into Facebook
+between runs. On your own laptop that is `.chrome-profile/`. From a sandbox — a
+CI job, a cloud agent — there is no window to log into and nothing survives the
+run, so instead you point the scraper at a [Sidekick](https://github.com/eladb/sidekick)
+box: a small server you own running a real headful Chromium behind a Cloudflare
+tunnel, reachable over CDP.
+
+```bash
+export SIDEKICK_TOKEN=...            # printed by sidekick's scripts/install.sh
+
+python scrape.py sidekick            # is the box up, and still logged in?
+python scrape.py login               # opens FB there; you click through in the watch URL
+python scrape.py crawl --group ...   # same as before, driving the remote browser
+```
+
+`SIDEKICK_TOKEN` is used automatically whenever it is set. `--local` ignores it
+and uses the local profile; `--sidekick` makes its absence an error instead of a
+silent fallback.
+
+What changes in this mode:
+
+- **Cookies live on the box, not in `.chrome-profile/`.** `login` is still a
+  one-time manual step, but you do it in the box's browser through the token's
+  watch URL (noVNC in a browser tab). The session then outlives every run.
+- **Page traffic comes from the box's IP** — one consistent location for one
+  account, instead of a session that hops networks between runs. Media downloads
+  are the exception: Playwright issues those from the driver process (wherever
+  you run the CLI) using the browser's cookies, not from inside the remote
+  browser. Signed CDN URLs don't check the caller's IP, so they work; if you
+  would rather every byte came from one address, run the CLI on the box itself
+  through the token's shell endpoint.
+- **The context is never closed.** Teardown just drops the CDP connection;
+  closing the box's browser would throw away the profile the next run needs.
+- `--headless` is ignored: the box runs headful under a virtual display, which
+  is also the less bannable configuration.
+
+The token is a full credential for that machine — it embeds the bearer secret in
+every endpoint URL. Keep it out of the repo (it is env-only by design, and
+nothing here logs it), and remember that "nothing leaves your machine" becomes
+"nothing leaves machines you control" once a box is in the loop. A
+`trycloudflare.com` quick-tunnel hostname dies with the `cloudflared` process
+that minted it, so a token that stops resolving usually means the tunnel
+rotated, not that the box is gone: re-run the installer and export the new one.
+
 ## Output layout
 
 ```
@@ -92,6 +138,10 @@ What they deliberately pin:
   yield nulls rather than exceptions, because a crawl must not die on one odd node.
 - **Media queue** — expired signed URLs retry three times then stop, and
   identical bytes are stored once.
+- **Sidekick token handling** — an unpadded or malformed token fails with a
+  sentence instead of a traceback, an absent one falls back to local Chrome
+  rather than erroring, and the line that goes into logs never carries the
+  secret.
 
 What they can't cover: whether the structural predicates in `extract.py` match
 the shapes Facebook is actually serving today. The fixtures encode the shapes as
