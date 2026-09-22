@@ -4,6 +4,7 @@ These run without Playwright installed -- the response objects are stubs shaped
 like the ones Playwright hands to a `page.on("response")` handler.
 """
 
+import re
 import pytest
 
 import scrape
@@ -173,3 +174,22 @@ class TestExpandPattern:
     def test_does_not_match_ordinary_buttons(self, label):
         import re
         assert not re.search(scrape.DEFAULT_EXPAND, label, re.I)
+
+
+class TestCommentSortPatterns:
+    """The 'All comments' switch is what makes small posts capture at all."""
+
+    def test_sort_button_matches_english_labels(self):
+        pat = re.compile(scrape.DEFAULT_SORT_BUTTON, re.I)
+        for label in ("Most relevant", "Newest﻿", "All comments", "Top comments"):
+            assert pat.search(label), label
+
+    def test_sort_choice_matches_all_comments_menu_item(self):
+        pat = re.compile(scrape.DEFAULT_SORT_CHOICE, re.I)
+        item = "All comments\nShow all comments, including potential spam."
+        assert pat.search(item)
+
+    def test_sort_choice_does_not_match_the_narrower_orderings(self):
+        pat = re.compile(scrape.DEFAULT_SORT_CHOICE, re.I)
+        assert not pat.search("Newest\nShow all comments with the newest comments first.")
+        assert not pat.search("Most relevant\nShow friends' comments and the most engaging comments first.")

@@ -11,6 +11,10 @@ archive/
 export.jsonl
 media/
 
+# The pseudonymization key. Publishing it would let anyone recompute the
+# anon: handles for known account ids and re-identify the archive.
+.pseudonym-salt
+
 __pycache__/
 *.py[cod]
 .pytest_cache/

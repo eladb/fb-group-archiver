@@ -201,3 +201,53 @@ def test_counts_reports_every_table(store, post):
     assert counts["posts"] == 1
     assert counts["raw"] == 1
     assert counts["media_pending"] == 1
+
+
+class TestReparseBackfill:
+    """Reparse must be able to correct fields on rows that already exist.
+
+    The tool's contract is "fix extract.py and reparse, never re-crawl", which
+    only holds if the upsert path actually rewrites existing rows.
+    """
+
+    def test_parent_id_backfilled_on_existing_comment(self, store):
+        store.upsert_comment({"id": "c1", "post_id": "p1", "text": "hi"})
+        store.upsert_comment({"id": "c1", "post_id": "p1", "text": "hi", "parent_id": "c0"})
+        row = store.db.execute("SELECT * FROM comments WHERE id='c1'").fetchone()
+        assert row["parent_id"] == "c0"
+
+    def test_pseudonymization_clears_existing_real_name(self, store, post):
+        store.upsert_post(post)
+        assert store.db.execute("SELECT author_name FROM posts WHERE id=?",
+                                (post["id"],)).fetchone()[0] == "Dana Cohen"
+        store.upsert_post({**post, "author_id": "anon:abc", "author_name": None})
+        row = store.db.execute("SELECT * FROM posts WHERE id=?", (post["id"],)).fetchone()
+        assert row["author_name"] is None
+        assert row["author_id"] == "anon:abc"
+
+    def test_identity_restored_when_pseudonymization_disabled(self, store, post):
+        store.upsert_post({**post, "author_id": "anon:abc", "author_name": None})
+        store.upsert_post(post)
+        row = store.db.execute("SELECT * FROM posts WHERE id=?", (post["id"],)).fetchone()
+        assert (row["author_id"], row["author_name"]) == ("100001", "Dana Cohen")
+
+    def test_unresolved_author_does_not_wipe_stored_identity(self, store, post):
+        store.upsert_post(post)
+        store.upsert_post({**post, "author_id": None, "author_name": None})
+        row = store.db.execute("SELECT * FROM posts WHERE id=?", (post["id"],)).fetchone()
+        assert row["author_name"] == "Dana Cohen"
+
+    def test_null_text_still_never_blanks_stored_text(self, store, post):
+        store.upsert_post(post)
+        store.upsert_post({**post, "text": None})
+        row = store.db.execute("SELECT * FROM posts WHERE id=?", (post["id"],)).fetchone()
+        assert row["text"] == post["text"]
+
+    def test_empty_attachments_do_not_clobber_stored_ones(self, store, post):
+        store.upsert_post(post)
+        before = store.db.execute("SELECT attachments FROM posts WHERE id=?",
+                                  (post["id"],)).fetchone()[0]
+        store.upsert_post({**post, "attachments": []})
+        after = store.db.execute("SELECT attachments FROM posts WHERE id=?",
+                                 (post["id"],)).fetchone()[0]
+        assert after == before
