@@ -117,10 +117,26 @@ def is_comment_node(d) -> bool:
     )
 
 
+# Keys whose subtrees describe the *viewer* -- the account running the scrape --
+# rather than the author of the content. Attributing a post or comment to the
+# scraping account is worse than leaving it null, so these are never searched.
+VIEWER_KEYS = {
+    "viewer_actor", "viewer", "viewer_feedback_reaction_info", "actor_provider",
+    "comment_composer_placeholder", "comet_composer", "if_viewer_can_comment_anonymously",
+    "owning_profile", "comment_composer",
+}
+
+# GroupAnonAuthorProfile is how Facebook represents a member who posted
+# anonymously: a stable per-group handle like "CuriousOtter1234" instead of a
+# real profile. It is a legitimate author, and treating it as one keeps those
+# contributions attributable to each other without identifying anyone.
+ACTOR_TYPENAMES = ("User", "Page", "Group", "GroupAnonAuthorProfile")
+
+
 def is_actor_node(d) -> bool:
     return (
         isinstance(d, dict)
-        and d.get("__typename") in ("User", "Page", "Group")
+        and d.get("__typename") in ACTOR_TYPENAMES
         and "name" in d
         and "id" in d
     )
@@ -142,13 +158,38 @@ def _text(node):
     return msg.get("text") if msg else None
 
 
+def _walk_excluding_viewer(obj, depth: int = 0):
+    """Like walk(), but never descends into viewer-context subtrees."""
+    if depth > MAX_DEPTH:
+        return
+    if isinstance(obj, dict):
+        yield obj
+        for key, val in obj.items():
+            if key in VIEWER_KEYS:
+                continue
+            yield from _walk_excluding_viewer(val, depth + 1)
+    elif isinstance(obj, list):
+        for val in obj:
+            yield from _walk_excluding_viewer(val, depth + 1)
+
+
 def _actor(node):
-    actor = dig(node, "actors", 0)
-    if not is_actor_node(actor):
-        actor = find_first(node, is_actor_node)
-    if not actor:
-        return None, None
-    return actor.get("id"), actor.get("name")
+    """Resolve the author of a post or comment.
+
+    Explicit author fields are tried first. Only then is the subtree searched,
+    and that search skips viewer context: a payload carries the scraping
+    account's own profile in several places, and an unguarded search reaches it
+    whenever the real author is absent or is an unrecognized type -- silently
+    attributing other people's words to the person running the archive.
+    """
+    for path in (("actors", 0), ("author",), ("comet_sections", "actor_photo", "story", "actors", 0)):
+        cand = dig(node, *path)
+        if is_actor_node(cand):
+            return cand.get("id"), cand.get("name")
+    for cand in _walk_excluding_viewer(node):
+        if is_actor_node(cand):
+            return cand.get("id"), cand.get("name")
+    return None, None
 
 
 def _created_at(node):

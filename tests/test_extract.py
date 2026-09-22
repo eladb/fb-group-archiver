@@ -244,3 +244,53 @@ class TestCommentThreading:
         node["comment_direct_parent"] = {"id": "current"}
         node["parent_comment"] = {"id": "older"}
         assert normalize_comment(node)["parent_id"] == "current"
+
+
+class TestActorResolution:
+    """Who wrote this. Getting it wrong is worse than leaving it blank."""
+
+    def test_viewer_context_is_never_used_as_author(self):
+        # A comment with no author of its own still carries the scraping
+        # account's profile in viewer context. That must not become the author.
+        node = {
+            "__typename": "Comment", "id": "c1", "created_time": 1,
+            "body": {"text": "hi"},
+            "feedback": {"viewer_actor": {"__typename": "User", "id": "620032",
+                                          "name": "The Person Scraping"}},
+        }
+        assert normalize_comment(node)["author_name"] is None
+
+    def test_explicit_author_wins_over_anything_deeper(self):
+        node = {
+            "__typename": "Comment", "id": "c2", "created_time": 1,
+            "body": {"text": "hi"},
+            "author": {"__typename": "User", "id": "1", "name": "Real Author"},
+            "feedback": {"viewer_actor": {"__typename": "User", "id": "620032",
+                                          "name": "The Person Scraping"}},
+        }
+        assert normalize_comment(node)["author_name"] == "Real Author"
+
+    def test_anonymous_group_author_is_a_valid_author(self):
+        node = {
+            "__typename": "Comment", "id": "c3", "created_time": 1,
+            "body": {"text": "hi"},
+            "author": {"__typename": "GroupAnonAuthorProfile", "id": "9",
+                       "name": "CuriousOtter1234"},
+        }
+        c = normalize_comment(node)
+        assert (c["author_id"], c["author_name"]) == ("9", "CuriousOtter1234")
+
+    def test_owning_profile_is_not_the_author(self):
+        node = {
+            "__typename": "Story", "post_id": "p1", "creation_time": 1,
+            "feedback": {"owning_profile": {"__typename": "Group", "id": "77",
+                                            "name": "The Group"}},
+        }
+        assert normalize_post(node)["author_name"] is None
+
+    def test_actors_array_still_preferred(self):
+        node = {
+            "__typename": "Story", "post_id": "p2", "creation_time": 1,
+            "actors": [{"__typename": "User", "id": "5", "name": "Poster"}],
+        }
+        assert normalize_post(node)["author_name"] == "Poster"
