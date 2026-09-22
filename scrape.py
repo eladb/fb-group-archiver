@@ -8,9 +8,11 @@ rewrites that break selector-based scrapers.
 
 Nothing leaves your machine. Run `login` once, then `crawl`.
 
-The browser can also be a Sidekick box you own -- a remote Chromium that keeps
-its Facebook session between runs, which is what makes this usable from a
-sandbox. Set SIDEKICK_TOKEN and it is used automatically; see sidekick.py.
+The browser can also be a remote one that keeps its Facebook session between
+runs, which is what makes this usable from a sandbox: a Sidekick box you own
+(set SIDEKICK_TOKEN and it is used automatically -- see sidekick.py), or a
+rented Browserbase session (--browserbase, opt-in every time -- see
+browserbase.py).
 """
 
 import argparse
@@ -27,6 +29,7 @@ try:
 except ImportError:  # keeps parsing/storage importable (and testable) without a browser
     sync_playwright = None
 
+import browserbase
 import sidekick
 from extract import harvest, typename_census
 from store import Store
@@ -58,56 +61,77 @@ def jitter(lo: float, hi: float) -> float:
 
 # ---------------------------------------------------------------- browser
 
-class BrowserSession:
-    """A browser to drive: the local Chrome profile, or a Sidekick box's.
+REMOTE_ERRORS = (sidekick.SidekickError, browserbase.BrowserbaseError)
 
-    One surface for both. The difference that matters is teardown -- a local
-    context is ours to close, while the remote one belongs to the box and has to
-    outlive the run, because it *is* the logged-in profile.
+
+class BrowserSession:
+    """A browser to drive: the local Chrome profile, or a remote one.
+
+    One surface for three cases. What differs is teardown, and each backend
+    owns that decision: a local context is ours to close, a Sidekick box's must
+    be left alone because it *is* the logged-in profile, and a Browserbase
+    session has to be closed and released or the meter keeps running.
     """
 
-    def __init__(self, pw, ctx, remote=None):
+    def __init__(self, pw, ctx, browser=None, remote=None):
         self.pw = pw
         self.ctx = ctx
-        self.remote = remote  # a sidekick.Sidekick, or None when local
+        self.browser = browser
+        self.remote = remote  # a sidekick.Sidekick or browserbase.Browserbase; None when local
 
     def page(self):
         return self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
 
     def close(self) -> None:
-        if self.remote is None:
-            self.ctx.close()
-        # Remote: stopping the driver drops the CDP connection and leaves the
-        # box's browser, its tabs and its cookies exactly as they were.
-        self.pw.stop()
+        try:
+            if self.remote is None:
+                self.ctx.close()
+            else:
+                self.remote.close(self.browser)
+        finally:
+            self.pw.stop()
+
+
+def pick_remote(args):
+    """Which browser to drive. Only --browserbase is ever opt-in -- it spends
+    metered minutes and runs from a datacenter IP, neither of which should
+    happen because a key happened to be in the environment."""
+    if getattr(args, "local", False):
+        return None
+    if getattr(args, "browserbase", False):
+        return browserbase.load(required=True)
+    return sidekick.load(required=getattr(args, "sidekick", False))
 
 
 def open_browser(args, headless: bool = None) -> BrowserSession:
     """A persistent real-Chrome profile: stable fingerprint, session survives runs.
 
-    Remotely that profile lives on a Sidekick box (see sidekick.py) and survives
-    this process entirely, which is the only way a sandboxed run gets a Facebook
-    session at all. Locally it is a directory.
+    Remotely that profile lives on a machine that outlives this process -- a
+    Sidekick box or a Browserbase context -- which is the only way a sandboxed
+    run gets a Facebook session at all. Locally it is a directory.
     """
     if sync_playwright is None:
         sys.exit("playwright is not installed -- see README.md")
     try:
-        remote = None if getattr(args, "local", False) else sidekick.load(
-            required=getattr(args, "sidekick", False)
-        )
-    except sidekick.SidekickError as exc:
-        sys.exit(f"sidekick: {exc}")
+        remote = pick_remote(args)
+    except REMOTE_ERRORS as exc:
+        sys.exit(str(exc))
 
     pw = sync_playwright().start()
     try:
         if remote is not None:
             log(remote.describe())
-            remote.version()  # fail fast, and legibly, on a box that is gone
-            _, ctx = remote.connect(pw)
-            log("attached to the sidekick browser over CDP")
+            if isinstance(remote, browserbase.Browserbase):
+                remote.start(timeout=getattr(args, "bb_timeout", browserbase.DEFAULT_TIMEOUT),
+                             proxy=getattr(args, "bb_proxy", False))
+                log(f"session {remote.session_id} on context {remote.context_id}")
+            else:
+                remote.version()  # fail fast, and legibly, on a box that is gone
+            browser, ctx = remote.connect(pw)
+            log(f"attached to the {remote.label} browser over CDP")
             if headless or getattr(args, "headless", False):
-                log("note: --headless is ignored on a sidekick box (it runs headful)")
-            return BrowserSession(pw, ctx, remote)
+                log(f"note: --headless is ignored on a {remote.label} browser (it runs headful)")
+            return BrowserSession(pw, ctx, browser, remote)
         ctx = pw.chromium.launch_persistent_context(
             user_data_dir=str(Path(args.profile)),
             channel="chrome",
@@ -116,10 +140,14 @@ def open_browser(args, headless: bool = None) -> BrowserSession:
             args=["--disable-blink-features=AutomationControlled"],
         )
         return BrowserSession(pw, ctx)
-    except sidekick.SidekickError as exc:
+    except REMOTE_ERRORS as exc:
+        if remote is not None:
+            remote.close()
         pw.stop()
-        sys.exit(f"sidekick: {exc}")
+        sys.exit(str(exc))
     except Exception:
+        if remote is not None:
+            remote.close()
         pw.stop()
         raise
 
@@ -245,11 +273,11 @@ def cmd_login(args) -> None:
         page.goto("https://www.facebook.com/", wait_until="domcontentloaded")
         if sess.remote is not None:
             print(
-                "\n  Facebook is open in the sidekick browser. Watch it and click\n"
-                "  through the login here (the URL carries your token -- keep it\n"
-                f"  to yourself):\n\n    {sess.remote.watch_url}\n"
-                "\n  Complete any 2FA and dismiss the cookie banner. The session\n"
-                "  stays on the box and is reused by every later `crawl`.\n"
+                f"\n  Facebook is open in the {sess.remote.label} browser. Watch it and\n"
+                "  click through the login here (the URL is a live handle on that\n"
+                f"  browser -- keep it to yourself):\n\n    {sess.remote.view_url}\n"
+                "\n  Complete any 2FA and dismiss the cookie banner. The session is\n"
+                "  kept in the remote profile and reused by every later `crawl`.\n"
                 "\n  Press Enter here once you're logged in..."
             )
         else:
@@ -495,15 +523,27 @@ def cmd_sidekick(args) -> None:
     """Is the box up, and is its browser still logged into Facebook?"""
     try:
         sk = sidekick.load(required=True)
-    except sidekick.SidekickError as exc:
-        raise SystemExit(f"sidekick: {exc}")
-    try:
         version = sk.version()
     except sidekick.SidekickError as exc:
         raise SystemExit(f"sidekick: {exc}")
     log(f"{sk.host} is reachable: {version.get('Browser', 'unknown browser')}")
-    if sk.watch_url:
-        print(f"  watch: {sk.watch_url}")
+    if sk.view_url:
+        print(f"  watch: {sk.view_url}")
+    check_login(args)
+
+
+def cmd_browserbase(args) -> None:
+    """Project, quota and profile -- and whether that profile is still logged in.
+
+    Opening the browser reports all of it. This starts a real session, so it
+    spends a minute of quota; the live view is not printed here because the
+    session is released on the way out. Use `login` for that.
+    """
+    check_login(args)
+
+
+def check_login(args) -> None:
+    """Attach to whichever browser the flags select and read its cookies."""
     if sync_playwright is None:
         log("playwright is not installed, so the login check is skipped")
         return
@@ -539,6 +579,13 @@ def main():
     ap.add_argument("--sidekick", action="store_true",
                     help="require the remote Sidekick browser (used automatically "
                          "whenever SIDEKICK_TOKEN is set)")
+    ap.add_argument("--browserbase", action="store_true",
+                    help="drive a rented Browserbase session (never automatic: it is "
+                         "metered and runs from a datacenter IP)")
+    ap.add_argument("--bb-timeout", type=int, default=browserbase.DEFAULT_TIMEOUT,
+                    help="Browserbase session cap in seconds (default: %(default)s)")
+    ap.add_argument("--bb-proxy", action="store_true",
+                    help="route the Browserbase session through its proxies (paid plans)")
     ap.add_argument("--local", action="store_true",
                     help="force the local Chrome profile, ignoring SIDEKICK_TOKEN")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -579,6 +626,10 @@ def main():
     p = sub.add_parser("sidekick", help="check the Sidekick box and its Facebook session")
     add_common(p)
     p.set_defaults(func=cmd_sidekick, sidekick=True)
+
+    p = sub.add_parser("browserbase", help="check the Browserbase project, context and session")
+    add_common(p)
+    p.set_defaults(func=cmd_browserbase, browserbase=True)
 
     for name, fn, helptext in (
         ("reparse", cmd_reparse, "re-normalize raw captures after a schema change"),

@@ -88,6 +88,8 @@ def split_auth(url: str):
 
 
 class Sidekick:
+    label = "sidekick"
+
     def __init__(self, claims: dict):
         self.claims = claims
 
@@ -100,6 +102,11 @@ class Sidekick:
     @property
     def host(self) -> str:
         return urllib.parse.urlsplit(self.base_url).netloc
+
+    @property
+    def view_url(self):
+        """Where a human watches and clicks: noVNC in a browser tab."""
+        return self.watch_url
 
     def describe(self) -> str:
         """The one line safe to log: box, host, age. No credential."""
@@ -189,6 +196,14 @@ class Sidekick:
         browser = pw.chromium.connect_over_cdp(clean, headers=headers)
         ctx = browser.contexts[0] if browser.contexts else browser.new_context()
         return browser, ctx
+
+    def close(self, browser=None) -> None:
+        """Deliberately nothing.
+
+        The box's browser outlives us -- it holds the profile. Dropping the
+        driver is enough to disconnect; closing anything here would discard the
+        session the next run needs.
+        """
 
 
 def main() -> int:

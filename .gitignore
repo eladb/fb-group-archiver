@@ -3,6 +3,9 @@
 .chrome-profile/
 *.chrome-profile/
 
+# Points at the Browserbase context holding that same logged-in profile.
+.browserbase-context
+
 # Scraped content: other people's posts, comments, names and photos.
 archive/
 *.ndjson.gz

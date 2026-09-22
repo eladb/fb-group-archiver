@@ -58,14 +58,29 @@ Useful flags:
 | `--delay-min/--delay-max` | scroll pacing in seconds (default 2.5–6.0) |
 | `--expand-pattern` | regex for "view more comments" in your UI language |
 
-## Driving a remote browser (Sidekick)
+## Driving a remote browser
 
 The hard requirement here is a Chrome profile that stays logged into Facebook
 between runs. On your own laptop that is `.chrome-profile/`. From a sandbox — a
 CI job, a cloud agent — there is no window to log into and nothing survives the
-run, so instead you point the scraper at a [Sidekick](https://github.com/eladb/sidekick)
-box: a small server you own running a real headful Chromium behind a Cloudflare
-tunnel, reachable over CDP.
+run, so the scraper can drive someone else's browser over CDP instead. Two
+backends, and they are not interchangeable:
+
+| | Sidekick | Browserbase |
+|---|---|---|
+| what it is | a box you own | a rented session |
+| IP | one stable address, yours | datacenter (`us-west-2`); residential proxies are a paid add-on |
+| cost | flat, per month | metered per browser-minute |
+| profile | lives on the box | a *context* restored into each session |
+| good for | the long sweep | a short run that checks whether the parser still matches |
+
+Both put the same `--headless`-less headful Chromium behind the same code path;
+what differs is what it costs you and what Facebook sees.
+
+### Sidekick
+
+A [Sidekick](https://github.com/eladb/sidekick) box is a small server you own
+running a real headful Chromium behind a Cloudflare tunnel.
 
 ```bash
 export SIDEKICK_TOKEN=...            # printed by sidekick's scripts/install.sh
@@ -103,6 +118,39 @@ nothing here logs it), and remember that "nothing leaves your machine" becomes
 `trycloudflare.com` quick-tunnel hostname dies with the `cloudflared` process
 that minted it, so a token that stops resolving usually means the tunnel
 rotated, not that the box is gone: re-run the installer and export the new one.
+
+### Browserbase
+
+[Browserbase](https://browserbase.com) rents a headful Chromium per session and
+restores a *context* — a saved profile — into each one. That context is what
+carries the login; without it every session starts logged out.
+
+```bash
+export BROWSERBASE_API_KEY=bb_...
+
+python scrape.py browserbase         # project, quota, and is the context logged in?
+python scrape.py --browserbase login # click through the login in the live view
+python scrape.py --browserbase crawl --group ... --max-posts 50 --no-media
+```
+
+Unlike `SIDEKICK_TOKEN`, the key is **never** picked up automatically — you ask
+for it with `--browserbase` every time, because each run spends quota and leaves
+from a datacenter IP. Two more flags: `--bb-timeout` caps the session (default
+3600s; the account default of 300s trips mid-crawl) and `--bb-proxy` asks for
+Browserbase's proxies, which paid plans have and free ones don't — you get a
+`402` with a link, not a silent direct connection.
+
+The context id is written to `.browserbase-context` (gitignored) on first use
+and reused after that. Keep it: losing it doesn't cost you an archive, but it
+does cost you the login. `BROWSERBASE_CONTEXT_ID` overrides the file, and
+`BROWSERBASE_PROJECT_ID` picks a project when the key has more than one.
+
+**This is the wrong tool for the full sweep.** A datacenter IP on a logged-in
+personal account is exactly the signal the ban-vector note below is about, and
+an hours-long crawl on a per-minute meter is an odd way to spend money. What it
+is genuinely good for is the run this README has been asking for since the
+start: fifty posts, no media, then `inspect` — enough to find out whether
+`extract.py` still matches what Facebook serves, without leaving a box running.
 
 ## Output layout
 
@@ -142,6 +190,11 @@ What they deliberately pin:
   sentence instead of a traceback, an absent one falls back to local Chrome
   rather than erroring, and the line that goes into logs never carries the
   secret.
+- **Browserbase session lifecycle** — the saved context is reused rather than
+  recreated (a new one is a logged-out one), the browser is closed *before* the
+  session is released so the profile persists, and a session is released even
+  when the browser is already gone, so a crashed run doesn't leave the meter
+  running.
 
 What they can't cover: whether the structural predicates in `extract.py` match
 the shapes Facebook is actually serving today. The fixtures encode the shapes as
