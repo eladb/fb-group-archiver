@@ -122,6 +122,21 @@ class Store:
 
     # ---- posts & comments --------------------------------------------
 
+    def _rewrite_identity(self, table: str, row: dict) -> None:
+        """Rewrite author fields outright whenever this parse resolved an author.
+
+        COALESCE is wrong here: turning pseudonymization on sets author_name to
+        NULL, and COALESCE would keep the stale real name forever. Reparse is
+        the documented way to change how identities are stored, so it has to be
+        able to clear them -- and to restore them when it is turned back off.
+        """
+        if row.get("author_id") is None and row.get("author_name") is None:
+            return
+        self.db.execute(
+            f"UPDATE {table} SET author_id=?, author_name=? WHERE id=?",
+            (row.get("author_id"), row.get("author_name"), row["id"]),
+        )
+
     def upsert_post(self, p: dict) -> bool:
         """Insert or refresh a post. Returns True if this id was not seen before."""
         now = int(time.time())
@@ -129,17 +144,23 @@ class Store:
         if existing:
             # Counts drift upward as a post accrues engagement; keep the latest,
             # but never overwrite text we already have with a null re-read.
+            atts = json.dumps(p.get("attachments") or [], ensure_ascii=False)
             self.db.execute(
                 """UPDATE posts SET
                      reaction_count=COALESCE(?, reaction_count),
                      comment_count =COALESCE(?, comment_count),
                      share_count   =COALESCE(?, share_count),
                      text          =COALESCE(NULLIF(?, ''), text),
+                     created_at    =COALESCE(?, created_at),
+                     url           =COALESCE(?, url),
+                     attachments   =CASE WHEN ? = '[]' THEN attachments ELSE ? END,
                      last_seen=?
                    WHERE id=?""",
                 (p.get("reaction_count"), p.get("comment_count"), p.get("share_count"),
-                 p.get("text"), now, p["id"]),
+                 p.get("text"), p.get("created_at"), p.get("url"), atts, atts,
+                 now, p["id"]),
             )
+            self._rewrite_identity("posts", p)
             return False
         self.db.execute(
             """INSERT INTO posts
@@ -170,10 +191,19 @@ class Store:
             )
             return True
         except sqlite3.IntegrityError:
+            atts = json.dumps(c.get("attachments") or [], ensure_ascii=False)
             self.db.execute(
-                "UPDATE comments SET text=COALESCE(NULLIF(?, ''), text), post_id=COALESCE(?, post_id) WHERE id=?",
-                (c.get("text"), c.get("post_id"), c["id"]),
+                """UPDATE comments SET
+                     text       =COALESCE(NULLIF(?, ''), text),
+                     post_id    =COALESCE(?, post_id),
+                     parent_id  =COALESCE(?, parent_id),
+                     created_at =COALESCE(?, created_at),
+                     attachments=CASE WHEN ? = '[]' THEN attachments ELSE ? END
+                   WHERE id=?""",
+                (c.get("text"), c.get("post_id"), c.get("parent_id"),
+                 c.get("created_at"), atts, atts, c["id"]),
             )
+            self._rewrite_identity("comments", c)
             return False
 
     # ---- media -------------------------------------------------------

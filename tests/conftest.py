@@ -7,6 +7,19 @@ import pytest
 # package directory, so put that directory on the path for tests.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import extract  # noqa: E402  (needs the path insert above)
+
+
+@pytest.fixture(autouse=True)
+def identities_visible(monkeypatch):
+    """Extraction tests assert on real author fields.
+
+    Pseudonymization is a separate, opt-out-able concern covered by its own
+    tests, so it is disabled for everything else rather than baked into every
+    expected value.
+    """
+    monkeypatch.setattr(extract, "PSEUDONYMIZE", False)
+
 
 CDN_IMAGE = "https://scontent-tlv3-1.xx.fbcdn.net/v/t39.30808-6/photo_a.jpg"
 CDN_VIDEO = "https://video-tlv3-1.xx.fbcdn.net/v/t42.1790-2/clip_b.mp4"

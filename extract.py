@@ -6,9 +6,51 @@ payload and recognizing nodes structurally. When a shape changes, the raw
 capture is still intact -- re-run `scrape.py reparse` rather than re-crawling.
 """
 
+import hashlib
+import os
 import re
+import secrets
+from pathlib import Path
 
 MAX_DEPTH = 40
+
+# ---- pseudonymization ------------------------------------------------
+# On by default: the archive keeps every post and comment body, timestamp and
+# count, but replaces author identities with a stable salted pseudonym so the
+# corpus is not a register of named people. Raw payloads are deliberately NOT
+# rewritten, so running `reparse` with FBGROUP_PSEUDONYMIZE=0 recovers real
+# identities if they are ever legitimately needed.
+PSEUDONYMIZE = os.environ.get("FBGROUP_PSEUDONYMIZE", "1") != "0"
+SALT_FILE = Path(os.environ.get("FBGROUP_SALT_FILE", ".pseudonym-salt"))
+
+_salt_cache = None
+
+
+def _salt() -> bytes:
+    """Per-archive random salt, created once and reused so pseudonyms are stable."""
+    global _salt_cache
+    if _salt_cache is None:
+        if SALT_FILE.exists():
+            _salt_cache = SALT_FILE.read_bytes().strip()
+        else:
+            _salt_cache = secrets.token_hex(32).encode()
+            SALT_FILE.write_bytes(_salt_cache)
+            try:
+                SALT_FILE.chmod(0o600)
+            except OSError:
+                pass
+    return _salt_cache
+
+
+def pseudonymize(author_id, author_name):
+    """Map an author to a stable opaque handle, or (None, None) if unidentified."""
+    if not PSEUDONYMIZE:
+        return author_id, author_name
+    if not author_id and not author_name:
+        return None, None
+    seed = str(author_id or author_name).encode()
+    digest = hashlib.blake2b(seed, key=_salt()[:64], digest_size=8).hexdigest()
+    return f"anon:{digest}", None
 
 MEDIA_URL_KEYS = {
     "uri", "src", "playable_url", "playable_url_quality_hd", "playable_url_dash_manifest",
@@ -123,26 +165,41 @@ def _created_at(node):
 
 
 def _feedback(node):
-    """Reaction / comment / share counts, wherever the feedback object landed."""
-    fb = node.get("feedback")
-    if not isinstance(fb, dict):
-        fb = find_first(
-            node,
-            lambda d: "reaction_count" in d or "total_comment_count" in d or "share_count" in d,
-        )
-    if not isinstance(fb, dict):
-        return None, None, None
-    reactions = dig(fb, "reaction_count", "count")
-    if reactions is None:
-        reactions = dig(fb, "reactors", "count")
-    comments = dig(fb, "total_comment_count")
-    if comments is None:
-        comments = dig(fb, "comment_rendering_instance", "comments", "total_count")
-    if comments is None:
-        comments = dig(fb, "comments", "total_count")
-    shares = dig(fb, "share_count", "count")
-    as_int = lambda v: int(v) if isinstance(v, (int, float)) else None
-    return as_int(reactions), as_int(comments), as_int(shares)
+    """Reaction / comment / share counts, wherever the feedback object landed.
+
+    Two shapes have to be tolerated. The story's own ``feedback`` key is
+    frequently a stub -- {id, associated_group, owning_profile} -- while the
+    real counts sit deeper in the UFI subtree, so finding a dict at
+    ``node["feedback"]`` must not stop the search. And counts arrive either
+    wrapped as {"count": N} or as a bare number, depending on the renderer.
+    """
+    def as_int(v):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        return int(v)
+
+    def count_of(v):
+        return as_int(v.get("count")) if isinstance(v, dict) else as_int(v)
+
+    reactions = comments = shares = None
+    for d in walk(node):
+        if reactions is None:
+            reactions = count_of(d.get("reaction_count"))
+        if reactions is None:
+            reactions = count_of(d.get("reactors"))
+        if comments is None:
+            comments = as_int(d.get("total_comment_count"))
+        if comments is None:
+            sub = d.get("comments")
+            if isinstance(sub, dict):
+                comments = as_int(sub.get("total_count"))
+        if comments is None:
+            comments = as_int(dig(d, "comment_rendering_instance", "comments", "total_count"))
+        if shares is None:
+            shares = count_of(d.get("share_count"))
+        if reactions is not None and comments is not None and shares is not None:
+            break
+    return reactions, comments, shares
 
 
 def _url(node, group_id, post_id):
@@ -173,7 +230,7 @@ def normalize_post(node, group_id=None, raw_ref=None):
     post_id = node.get("post_id") or node.get("id")
     if not isinstance(post_id, str) or not post_id:
         return None
-    author_id, author_name = _actor(node)
+    author_id, author_name = pseudonymize(*_actor(node))
     reactions, comments, shares = _feedback(node)
     media = media_urls(node)
     return {
@@ -196,11 +253,17 @@ def normalize_comment(node, post_id=None, raw_ref=None):
     cid = node.get("id")
     if not isinstance(cid, str) or not cid:
         return None
-    author_id, author_name = _actor(node)
+    author_id, author_name = pseudonymize(*_actor(node))
     body = dig(node, "body", "text")
     if not isinstance(body, str):
         body = None
-    parent = dig(node, "parent_comment", "id") or dig(node, "parent_feedback", "id")
+    # Replies name their parent under comment_direct_parent; the older
+    # parent_comment / parent_feedback spellings are kept as fallbacks.
+    parent = (
+        dig(node, "comment_direct_parent", "id")
+        or dig(node, "parent_comment", "id")
+        or dig(node, "parent_feedback", "id")
+    )
     media = media_urls(node)
     return {
         "id": cid,

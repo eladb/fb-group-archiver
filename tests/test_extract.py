@@ -216,3 +216,31 @@ def test_typename_census_counts_occurrences(feed_payload):
     assert census["Story"] == 2
     assert census["User"] == 2
     assert census["Photo"] == 2
+
+
+class TestCommentThreading:
+    """Replies must keep their parent link, or the thread structure is lost."""
+
+    def test_comment_direct_parent_is_used(self):
+        node = make_comment_node(cid="reply1")
+        node["comment_direct_parent"] = {
+            "id": "parent1",
+            "author": {"__typename": "User", "id": "9", "name": "Someone"},
+        }
+        assert normalize_comment(node)["parent_id"] == "parent1"
+
+    def test_null_direct_parent_means_top_level(self):
+        node = make_comment_node(cid="top1")
+        node["comment_direct_parent"] = None
+        assert normalize_comment(node)["parent_id"] is None
+
+    def test_legacy_parent_spellings_still_work(self):
+        node = make_comment_node(cid="reply2")
+        node["parent_comment"] = {"id": "older"}
+        assert normalize_comment(node)["parent_id"] == "older"
+
+    def test_direct_parent_wins_over_legacy(self):
+        node = make_comment_node(cid="reply3")
+        node["comment_direct_parent"] = {"id": "current"}
+        node["parent_comment"] = {"id": "older"}
+        assert normalize_comment(node)["parent_id"] == "current"
