@@ -193,3 +193,27 @@ class TestCommentSortPatterns:
         pat = re.compile(scrape.DEFAULT_SORT_CHOICE, re.I)
         assert not pat.search("Newest\nShow all comments with the newest comments first.")
         assert not pat.search("Most relevant\nShow friends' comments and the most engaging comments first.")
+
+
+class TestInGroupFilter:
+    """Permalink pages carry Facebook's recommendations; those are not group content."""
+
+    def test_group_permalink_is_in_group(self):
+        p = {"url": "https://www.facebook.com/groups/mygroup/posts/123/"}
+        assert scrape.in_group(p, "mygroup")
+
+    def test_reel_is_not_in_group(self):
+        p = {"url": "https://www.facebook.com/reel/1630791632167210/"}
+        assert not scrape.in_group(p, "mygroup")
+
+    def test_other_group_is_not_in_group(self):
+        p = {"url": "https://www.facebook.com/groups/someothergroup/posts/9/"}
+        assert not scrape.in_group(p, "mygroup")
+
+    def test_missing_url_is_not_in_group(self):
+        assert not scrape.in_group({}, "mygroup")
+        assert not scrape.in_group({"url": None}, "mygroup")
+
+    def test_no_group_id_keeps_everything(self):
+        # Without a group to compare against, filtering would silently drop data.
+        assert scrape.in_group({"url": "https://www.facebook.com/reel/1/"}, None)

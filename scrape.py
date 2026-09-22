@@ -54,7 +54,8 @@ DEFAULT_SORT_CHOICE = r"^\s*(all comments|כל התגובות)"
 
 # Comment threads load in slices; these bound the per-post effort.
 EXPANDS_PER_ROUND = 6      # reply expanders clicked before scrolling again
-COMMENT_IDLE_ROUNDS = 3    # consecutive no-progress rounds before moving on
+COMMENT_IDLE_ROUNDS = 3    # consecutive rounds yielding no new comments
+POST_TIME_BUDGET = 150     # seconds; hard cap so one odd page cannot stall a run
 
 
 def log(msg: str) -> None:
@@ -140,6 +141,24 @@ class Capture:
 
 # ---------------------------------------------------------------- pipeline
 
+def in_group(post: dict, group_id: str) -> bool:
+    """Is this post actually part of the group being archived?
+
+    A permalink page carries Facebook's recommendations alongside the post --
+    reels and videos from elsewhere entirely. Those nodes parse perfectly well,
+    so without this check they are stored as group content, stamped with the
+    crawl's group id, and then queued for a comment pass that can never fetch
+    them (a reel is a different page type). One live capture picked up 18 such
+    reels carrying 64,942 phantom comments: 89% of the apparent remaining work,
+    none of it real, and retried forever because `have < comment_count` stays
+    true.
+    """
+    if not group_id:
+        return True
+    url = post.get("url") or ""
+    return f"/groups/{group_id}/" in url or f"/groups/{group_id}" == url.rstrip("/")
+
+
 def ingest(store: Store, capture: Capture, group_id: str, known: set) -> int:
     """Persist everything captured so far. Returns the count of new posts."""
     new_posts = 0
@@ -147,6 +166,8 @@ def ingest(store: Store, capture: Capture, group_id: str, known: set) -> int:
         raw_ref = store.append_raw(url, friendly, payload)
         posts, comments = harvest(payload, group_id, raw_ref)
         for p in posts:
+            if not in_group(p, group_id):
+                continue
             if store.upsert_post(p):
                 new_posts += 1
                 known.add(p["id"])
@@ -354,8 +375,16 @@ def cmd_comments(args) -> None:
                FROM posts p
                WHERE p.comment_count > 0
                  AND p.url IS NOT NULL
+                 AND p.url LIKE '%/groups/%'
                  AND have < p.comment_count
-               ORDER BY p.created_at DESC"""
+               -- Never-fetched posts first. A post whose capture came within a
+               -- comment or two of its reported count never satisfies
+               -- `have < comment_count` (the count and what is fetchable differ
+               -- slightly), so it stays queued forever. Newest-first ordering
+               -- then puts that permanent residue at the head of the queue, and
+               -- every restart re-walks it, re-fetching comments already stored
+               -- and recording nothing new.
+               ORDER BY (have > 0), p.created_at DESC"""
         ).fetchall()
         log(f"{len(rows)} posts with unfetched comments")
 
@@ -373,7 +402,8 @@ def cmd_comments(args) -> None:
                     raw_ref = store.append_raw(url, friendly, payload)
                     posts, comments = harvest(payload, group_id, raw_ref)
                     for p_ in posts:
-                        store.upsert_post(p_)
+                        if in_group(p_, group_id):
+                            store.upsert_post(p_)
                     for c in comments:
                         c["post_id"] = c.get("post_id") or row["id"]
                         if store.upsert_comment(c):
@@ -395,6 +425,7 @@ def cmd_comments(args) -> None:
                 # replies, then silently stops. Alternate expanding and
                 # scrolling, and give up once consecutive rounds add nothing.
                 stale = 0
+                deadline = time.time() + POST_TIME_BUDGET
                 for _ in range(args.max_expansions):
                     clicks = 0
                     while clicks < EXPANDS_PER_ROUND:
@@ -409,12 +440,19 @@ def cmd_comments(args) -> None:
                         page.wait_for_timeout(int(jitter(1.0, 2.2) * 1000))
                     page.mouse.wheel(0, 4000)
                     page.wait_for_timeout(int(jitter(1.5, 3.0) * 1000))
-                    if absorb() == 0 and clicks == 0:
+                    # Progress means NEW COMMENTS, not clicks. An expander that
+                    # matches but never disappears would otherwise reset the idle
+                    # counter every round and burn the full budget yielding
+                    # nothing -- five minutes per post, silently.
+                    if absorb() == 0:
                         stale += 1
                         if stale >= COMMENT_IDLE_ROUNDS:
                             break
                     else:
                         stale = 0
+                    if time.time() > deadline:
+                        log(f"  {row['id']}: time budget reached, moving on")
+                        break
             except Exception as exc:
                 log(f"  {row['id']}: {str(exc)[:120]}")
 
@@ -459,6 +497,8 @@ def cmd_reparse(args) -> None:
     for offset, payload in store.iter_raw():
         p, c = harvest(payload, group_id, offset)
         for item in p:
+            if not in_group(item, group_id):
+                continue
             store.upsert_post(item)
             posts += 1
         for item in c:
