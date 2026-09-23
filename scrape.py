@@ -10,11 +10,14 @@ Nothing leaves your machine. Run `login` once, then `crawl`.
 """
 
 import argparse
+import base64
+import datetime as dt
 import json
 import random
 import re
 import sys
 import time
+import urllib.parse
 from collections import deque
 from pathlib import Path
 
@@ -489,6 +492,125 @@ def cmd_media(args) -> None:
         pw.stop()
 
 
+
+# ---------------------------------------------------------------- backfill
+
+# Facebook's group search accepts a creation-time filter, encoded as base64 of a
+# JSON envelope. Month and week bounds are honoured; narrower ones are not --
+# two- and three-day windows were observed returning posts months outside the
+# range -- so the window is a hint and every post is re-checked against it.
+#
+# Search also caps a single query at ~64 results regardless of how much matches,
+# and ignores some very common words entirely (a, I, is return nothing). One
+# query therefore cannot enumerate a busy week: the way to approach completeness
+# is many terms over a narrow window, unioned by post id, until new terms stop
+# contributing.
+BACKFILL_TERMS = [
+    "the", "to", "and", "my", "for", "he", "she", "was", "with", "have",
+    "not", "you", "her", "his", "that", "this", "son", "daughter", "doctor",
+    "help", "anyone", "pandas", "pans", "flare", "strep", "test", "treatment",
+]
+
+
+def search_filter(start, end) -> str:
+    """base64 creation-time filter for a [start, end] date window."""
+    args = json.dumps({
+        "start_year": str(start.year),
+        "start_month": f"{start.year}-{start.month}",
+        "start_day": f"{start.year}-{start.month}-{start.day}",
+        "end_year": str(end.year),
+        "end_month": f"{end.year}-{end.month}",
+        "end_day": f"{end.year}-{end.month}-{end.day}",
+    })
+    envelope = {"rp_creation_time:0": json.dumps({"name": "creation_time", "args": args})}
+    return base64.b64encode(json.dumps(envelope).encode()).decode()
+
+
+def cmd_backfill(args) -> None:
+    """Walk backwards through history with date-windowed search.
+
+    The feed stalls a few weeks back -- a Facebook-side depth ceiling -- so the
+    only route to older posts is the group's own search, bounded by date and
+    unioned across query terms. Resumable: completed windows are recorded in
+    state, so an interrupted run skips what it already swept.
+    """
+    store = Store(Path(args.out))
+    pw, ctx = open_browser(Path(args.profile), headless=args.headless)
+    try:
+        if not is_logged_in(ctx):
+            raise SystemExit("Not logged in. Run `scrape.py login` first.")
+        group_id = store.get_state("group_id") or resolve_group(
+            ctx.pages[0] if ctx.pages else ctx.new_page(), args.group)
+        store.set_state("group_id", group_id)
+
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        capture = Capture()
+        capture.attach(page)
+
+        done = set(json.loads(store.get_state("backfill_windows") or "[]"))
+        terms = [t.strip() for t in args.terms.split(",") if t.strip()]
+        end = dt.date.fromisoformat(args.until)
+        start = dt.date.fromisoformat(args.since)
+        deadline = time.time() + args.max_minutes * 60 if args.max_minutes else None
+
+        # Newest window first: recent history is the most likely to be wanted,
+        # and it verifies the machinery against data the feed already proved.
+        windows = []
+        cur_end = end
+        while cur_end >= start:
+            cur_start = max(start, cur_end - dt.timedelta(days=args.window_days - 1))
+            windows.append((cur_start, cur_end))
+            cur_end = cur_start - dt.timedelta(days=1)
+
+        log(f"{len(windows)} windows of {args.window_days}d from {start} to {end}; "
+            f"{len(done)} already swept")
+
+        for w_start, w_end in windows:
+            key = f"{w_start}:{w_end}"
+            if key in done:
+                continue
+            if deadline and time.time() > deadline:
+                log("time budget reached; rerun to continue")
+                break
+
+            filt = search_filter(w_start, w_end)
+            seen_before = store.db.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
+            for term in terms:
+                if deadline and time.time() > deadline:
+                    break
+                url = (f"https://www.facebook.com/groups/{group_id}/search/"
+                       f"?q={urllib.parse.quote(term)}&filters={filt}")
+                try:
+                    page.goto(url, wait_until="domcontentloaded")
+                    page.wait_for_timeout(int(jitter(4.0, 7.0) * 1000))
+                    stale = 0
+                    for _ in range(args.max_scrolls):
+                        page.mouse.wheel(0, 5000)
+                        page.wait_for_timeout(int(jitter(1.8, 3.2) * 1000))
+                        if ingest(store, capture, group_id, set()) == 0:
+                            stale += 1
+                            if stale >= 3:
+                                break
+                        else:
+                            stale = 0
+                except Exception as exc:
+                    log(f"  {key} q={term}: {str(exc)[:100]}")
+                time.sleep(jitter(args.delay_min, args.delay_max))
+
+            gained = store.db.execute("SELECT COUNT(*) FROM posts").fetchone()[0] - seen_before
+            done.add(key)
+            store.set_state("backfill_windows", json.dumps(sorted(done)))
+            store.commit()
+            log(f"  {key}: +{gained} new posts (total {store.counts()['posts']})")
+            time.sleep(jitter(args.delay_min, args.delay_max) * 2)
+
+        log(f"backfill pass done: {store.counts()}")
+    finally:
+        store.close()
+        ctx.close()
+        pw.stop()
+
+
 def cmd_reparse(args) -> None:
     """Re-run the normalizer over raw captures -- no network, no re-crawl."""
     store = Store(Path(args.out))
@@ -608,6 +730,20 @@ def main():
                    help="regex matching your UI language's expander buttons")
     add_common(p)
     p.set_defaults(func=cmd_comments)
+
+    p = sub.add_parser("backfill",
+                       help="walk older history via date-windowed search (past the feed's ceiling)")
+    p.add_argument("--group", required=True, help="group URL or share link")
+    p.add_argument("--since", required=True, help="oldest date to sweep, YYYY-MM-DD")
+    p.add_argument("--until", required=True, help="newest date to sweep, YYYY-MM-DD")
+    p.add_argument("--window-days", type=int, default=7,
+                   help="days per search window (default 7; search caps at ~64 hits per query)")
+    p.add_argument("--terms", default=",".join(BACKFILL_TERMS),
+                   help="comma-separated query terms to union over each window")
+    p.add_argument("--max-scrolls", type=int, default=20)
+    p.add_argument("--max-minutes", type=float, default=0, help="stop cleanly after N minutes")
+    add_common(p, media_default=False)
+    p.set_defaults(func=cmd_backfill)
 
     p = sub.add_parser("media", help="download any queued media")
     add_common(p)
