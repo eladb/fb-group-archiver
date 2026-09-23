@@ -153,6 +153,14 @@ def provider_keeplist(full_names, db):
     Returned names are exempted from redaction: in a patient community the
     clinicians who participate are exactly the ones a reader needs to see, and
     the lexicon would otherwise scrub them as ordinary members.
+
+    Deliberately conservative, and it must stay that way. A third signal --
+    matching a member's SURNAME against clinicians the group discusses -- was
+    tried and removed. In a community that talks constantly about well-known
+    clinicians, surnames collide with ordinary members, and every collision
+    exempts a member from redaction and publishes their real name. Missing a
+    clinician is a nuisance; publishing a member is a harm. Do not add a signal
+    that can fire on a member, however many clinicians it would catch.
     """
     keep, why = set(), {}
     for name in full_names:
