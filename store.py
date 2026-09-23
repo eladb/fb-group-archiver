@@ -3,9 +3,56 @@
 import gzip
 import hashlib
 import json
+import re
 import sqlite3
 import time
 from pathlib import Path
+
+# Raw capture is chunked: a new gzip file every ~256MB of captures. A sealed
+# chunk never changes again, so it is encrypted, verified and uploaded once and
+# then left alone. The alternative -- one ever-growing file -- re-uploads and
+# re-verifies the entire corpus every hour, which is invisible at 500MB and
+# ruinous at 15GB.
+#
+# Chunks are keyed on CAPTURE time, not on the dates of the posts inside them.
+# One GraphQL payload is a page of results and can carry posts from many
+# different months, so content-time chunking is not well defined. Nor does a
+# calendar month bound anything useful: sustained crawling runs at ~18MB/hour,
+# so a month of it is ~13GB. Size is the only unit that actually bounds work.
+RAW_CHUNK_BYTES = 256 * 1024 * 1024
+RAW_GLOB = "raw-*.ndjson.gz"
+LEGACY_RAW = "raw.ndjson.gz"
+
+
+def _chunk_seq(path) -> int:
+    """Sequence number out of raw-YYYY-MM.NNNN.ndjson.gz.
+
+    Sorting on this rather than on the filename keeps capture order correct
+    across a month boundary and, because it is zero-padded at four digits,
+    past the point where a plain lexical sort puts 0010 before 0009.
+    """
+    m = re.search(r"\.(\d+)\.ndjson\.gz$", path.name)
+    return int(m.group(1)) if m else 0
+
+
+def _size(path) -> int:
+    return path.stat().st_size if path.exists() else 0
+
+
+def raw_chunk_paths(directory) -> list:
+    """Every raw chunk in `directory`, oldest first.
+
+    The pre-chunking raw.ndjson.gz sorts first when present; then
+    raw-YYYY-MM.NNNN.ndjson.gz by sequence number. Shared with redact_sample so
+    the two cannot disagree about what "the raw capture" means -- a lexicon
+    built from a subset of the chunks silently under-redacts.
+    """
+    directory = Path(directory)
+    if directory.is_file():          # an explicit single chunk still works
+        return [directory]
+    chunks = sorted(directory.glob(RAW_GLOB), key=_chunk_seq)
+    legacy = directory / LEGACY_RAW
+    return ([legacy] if legacy.exists() else []) + chunks
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS posts (
@@ -85,7 +132,8 @@ class Store:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.media_dir = self.dir / "media"
         self.media_dir.mkdir(exist_ok=True)
-        self.raw_path = self.dir / "raw.ndjson.gz"
+        self.legacy_raw = self.dir / LEGACY_RAW
+        self._chunk = None
         self.db = sqlite3.connect(self.dir / "archive.db")
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
@@ -98,10 +146,39 @@ class Store:
 
     # ---- raw capture -------------------------------------------------
 
+    def raw_chunks(self) -> list:
+        """Every raw chunk in capture order, oldest first.
+
+        A pre-chunking raw.ndjson.gz, if one is present, sorts first and is
+        treated as chunk zero: it holds the oldest captures and is never
+        appended to again once chunking takes over. That makes the changeover a
+        no-op -- nothing to rename, and no window in which a still-running
+        collector could recreate a file that was moved out from under it.
+        """
+        return raw_chunk_paths(self.dir)
+
+    def _write_chunk(self):
+        """The chunk to append to, rolling over once the current one is full.
+
+        Rolling happens only BETWEEN payloads, never inside one, so every chunk
+        holds a whole number of complete gzip members -- which is what lets a
+        sealed chunk be verified on its own and lets `cat`-ed chunks decompress
+        as a single stream.
+        """
+        if self._chunk is not None and _size(self._chunk) < RAW_CHUNK_BYTES:
+            return self._chunk
+        chunks = sorted(self.dir.glob(RAW_GLOB), key=_chunk_seq)
+        if chunks and _size(chunks[-1]) < RAW_CHUNK_BYTES:
+            self._chunk = chunks[-1]
+        else:
+            seq = _chunk_seq(chunks[-1]) + 1 if chunks else 1
+            self._chunk = self.dir / f"raw-{time.strftime('%Y-%m')}.{seq:04d}.ndjson.gz"
+        return self._chunk
+
     def append_raw(self, url: str, friendly: str, payload: dict) -> int:
         """Persist one GraphQL payload verbatim. Returns its raw_ref."""
         offset = self._raw_lines
-        with gzip.open(self.raw_path, "at", encoding="utf-8") as fh:
+        with gzip.open(self._write_chunk(), "at", encoding="utf-8") as fh:
             fh.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
         self._raw_lines += 1
         cur = self.db.execute(
@@ -111,14 +188,19 @@ class Store:
         return cur.lastrowid
 
     def iter_raw(self):
-        """Replay every captured payload, for re-parsing without re-crawling."""
-        if not self.raw_path.exists():
-            return
-        with gzip.open(self.raw_path, "rt", encoding="utf-8") as fh:
-            for offset, line in enumerate(fh):
-                line = line.strip()
-                if line:
-                    yield offset, json.loads(line)
+        """Replay every captured payload, for re-parsing without re-crawling.
+
+        Walks the chunks in capture order and counts the offset across all of
+        them, so it keeps the meaning it had when raw capture was one file: a
+        position in the whole corpus, not within a chunk.
+        """
+        offset = 0
+        for chunk in self.raw_chunks():
+            with gzip.open(chunk, "rt", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.strip():
+                        yield offset, json.loads(line)
+                    offset += 1
 
     # ---- posts & comments --------------------------------------------
 

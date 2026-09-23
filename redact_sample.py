@@ -83,8 +83,14 @@ PROVIDER_PATTERNS = [
 ]
 
 
+from store import raw_chunk_paths
+
+
 def build_lexicon(raw_path):
-    """Every personal name the capture ever saw, from the unpseudonymized payloads."""
+    """Every personal name the capture ever saw, from the unpseudonymized payloads.
+
+    `raw_path` may be the archive directory or a single chunk file.
+    """
     names = set()
 
     def walk(node):
@@ -99,15 +105,20 @@ def build_lexicon(raw_path):
             for value in node:
                 walk(value)
 
-    with gzip.open(raw_path, "rt", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                walk(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+    # Raw capture is chunked, so this walks every chunk. Reading only one would
+    # build the lexicon from part of the corpus -- and a name missing from the
+    # lexicon is a name that never gets redacted, which fails silently and in
+    # the one direction that matters.
+    for chunk in raw_chunk_paths(raw_path):
+        with gzip.open(chunk, "rt", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    walk(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
 
     full = {n.strip() for n in names if len(n.strip()) > 2}
     tokens = set()
@@ -303,7 +314,8 @@ def when(ts):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="archive/archive.db")
-    ap.add_argument("--raw", default="archive/raw.ndjson.gz")
+    ap.add_argument("--raw", default="archive",
+                    help="archive directory holding the raw chunks, or one chunk file")
     ap.add_argument("--out", default="archive/sample-redacted.html")
     ap.add_argument("--threads", type=int, default=3, help="threads per size band")
     ap.add_argument("--redact-clinicians", action="store_true",
