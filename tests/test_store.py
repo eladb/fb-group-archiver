@@ -8,6 +8,7 @@ import pytest
 
 from conftest import make_post_node
 from extract import normalize_post
+import store as store_mod
 from store import Store
 
 
@@ -146,9 +147,26 @@ class TestRawCapture:
     def test_written_as_gzipped_ndjson(self, store):
         store.append_raw("u", "F", {"a": 1})
         store.append_raw("u", "F", {"b": 2})
-        with gzip.open(store.raw_path, "rt", encoding="utf-8") as fh:
-            lines = [l for l in fh.read().splitlines() if l]
+        chunks = store.raw_chunks()
+        assert chunks, "append_raw must create a chunk"
+        lines = []
+        for chunk in chunks:
+            with gzip.open(chunk, "rt", encoding="utf-8") as fh:
+                lines += [l for l in fh.read().splitlines() if l]
         assert [json.loads(l) for l in lines] == [{"a": 1}, {"b": 2}]
+
+    def test_rolls_to_a_new_chunk_past_the_size_cap(self, store, monkeypatch):
+        """Each chunk must stand alone, so rolling happens between payloads."""
+        monkeypatch.setattr(store_mod, "RAW_CHUNK_BYTES", 512)
+        for i in range(60):
+            store.append_raw("u", "F", {"i": i, "pad": "x" * 200})
+        chunks = store.raw_chunks()
+        assert len(chunks) > 1, "should have rolled"
+        for chunk in chunks:
+            with gzip.open(chunk, "rt", encoding="utf-8") as fh:
+                fh.read()          # each chunk is a valid stream on its own
+        offsets = [off for off, _ in store.iter_raw()]
+        assert offsets == list(range(60)), "offsets must stay global across chunks"
 
     def test_offsets_continue_across_reopen(self, tmp_path):
         """A resumed run must not overwrite offsets from the previous session."""

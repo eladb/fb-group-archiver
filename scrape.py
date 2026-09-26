@@ -391,6 +391,7 @@ def cmd_comments(args) -> None:
         ).fetchall()
         log(f"{len(rows)} posts with unfetched comments")
 
+        short_circuited = 0
         for i, row in enumerate(rows, 1):
             if args.max_posts and i > args.max_posts:
                 break
@@ -418,44 +419,64 @@ def cmd_comments(args) -> None:
             try:
                 page.goto(row["url"], wait_until="domcontentloaded")
                 page.wait_for_timeout(int(jitter(2.0, 4.0) * 1000))
-                if not force_all_comments(page, sort_button_re, sort_choice_re):
-                    log(f"  {row['id']}: could not switch to All comments")
+
+                # Drain what the permalink render already fired BEFORE doing any
+                # work, and stop here if it satisfied the post. A short thread
+                # arrives complete in that first payload, and most posts are
+                # short -- about three quarters have 20 comments or fewer, yet
+                # each paid the same 12-20s of fixed overhead as a 300-comment
+                # thread: sort switch, expansion round, scroll.
+                #
+                # The test is exactly the one the queue uses to decide a post
+                # still needs work, so this can never skip something the next
+                # run would re-open. It also makes FEWER requests rather than
+                # more, which matters when the constraint is the account rather
+                # than the pipe.
                 absorb()
-                # Facebook paginates top-level comments by SCROLL, not by a
-                # button -- a permalink renders only the first slice and loads
-                # the next as the viewport nears the end of the thread. Clicking
-                # expanders alone therefore captures the first slice and its
-                # replies, then silently stops. Alternate expanding and
-                # scrolling, and give up once consecutive rounds add nothing.
-                stale = 0
-                deadline = time.time() + POST_TIME_BUDGET
-                for _ in range(args.max_expansions):
-                    clicks = 0
-                    while clicks < EXPANDS_PER_ROUND:
-                        buttons = page.get_by_role("button").filter(has_text=expand_re)
-                        if buttons.count() == 0:
+                have = store.db.execute(
+                    "SELECT COUNT(*) FROM comments WHERE post_id=?", (row["id"],)
+                ).fetchone()[0]
+                if have >= (row["comment_count"] or 0):
+                    short_circuited += 1
+                else:
+                    if not force_all_comments(page, sort_button_re, sort_choice_re):
+                        log(f"  {row['id']}: could not switch to All comments")
+                    absorb()
+                    # Facebook paginates top-level comments by SCROLL, not by a
+                    # button -- a permalink renders only the first slice and loads
+                    # the next as the viewport nears the end of the thread. Clicking
+                    # expanders alone therefore captures the first slice and its
+                    # replies, then silently stops. Alternate expanding and
+                    # scrolling, and give up once consecutive rounds add nothing.
+                    stale = 0
+                    deadline = time.time() + POST_TIME_BUDGET
+                    for _ in range(args.max_expansions):
+                        clicks = 0
+                        while clicks < EXPANDS_PER_ROUND:
+                            buttons = page.get_by_role("button").filter(has_text=expand_re)
+                            if buttons.count() == 0:
+                                break
+                            try:
+                                buttons.first.click(timeout=5000)
+                            except Exception:
+                                break
+                            clicks += 1
+                            page.wait_for_timeout(int(jitter(1.0, 2.2) * 1000))
+                        page.mouse.wheel(0, 4000)
+                        page.wait_for_timeout(int(jitter(1.5, 3.0) * 1000))
+                        # Progress means NEW COMMENTS, not clicks. An expander that
+                        # matches but never disappears would otherwise reset the idle
+                        # counter every round and burn the full budget yielding
+                        # nothing -- five minutes per post, silently.
+                        if absorb() == 0:
+                            stale += 1
+                            if stale >= COMMENT_IDLE_ROUNDS:
+                                break
+                        else:
+                            stale = 0
+                        if time.time() > deadline:
+                            log(f"  {row['id']}: time budget reached, moving on")
                             break
-                        try:
-                            buttons.first.click(timeout=5000)
-                        except Exception:
-                            break
-                        clicks += 1
-                        page.wait_for_timeout(int(jitter(1.0, 2.2) * 1000))
-                    page.mouse.wheel(0, 4000)
-                    page.wait_for_timeout(int(jitter(1.5, 3.0) * 1000))
-                    # Progress means NEW COMMENTS, not clicks. An expander that
-                    # matches but never disappears would otherwise reset the idle
-                    # counter every round and burn the full budget yielding
-                    # nothing -- five minutes per post, silently.
-                    if absorb() == 0:
-                        stale += 1
-                        if stale >= COMMENT_IDLE_ROUNDS:
-                            break
-                    else:
-                        stale = 0
-                    if time.time() > deadline:
-                        log(f"  {row['id']}: time budget reached, moving on")
-                        break
             except Exception as exc:
                 log(f"  {row['id']}: {str(exc)[:120]}")
 
@@ -466,7 +487,7 @@ def cmd_comments(args) -> None:
             if i % 10 == 0:
                 log(f"{i}/{len(rows)} posts -- {store.counts()}")
             time.sleep(jitter(args.delay_min, args.delay_max))
-        log(f"done: {store.counts()}")
+        log(f"done: {store.counts()}; {short_circuited}/{len(rows)} complete on open")
     finally:
         store.close()
         ctx.close()
