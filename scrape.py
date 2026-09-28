@@ -420,28 +420,33 @@ def cmd_comments(args) -> None:
                 page.goto(row["url"], wait_until="domcontentloaded")
                 page.wait_for_timeout(int(jitter(2.0, 4.0) * 1000))
 
-                # Drain what the permalink render already fired BEFORE doing any
-                # work, and stop here if it satisfied the post. A short thread
-                # arrives complete in that first payload, and most posts are
-                # short -- about three quarters have 20 comments or fewer, yet
-                # each paid the same 12-20s of fixed overhead as a 300-comment
-                # thread: sort switch, expansion round, scroll.
+                if not force_all_comments(page, sort_button_re, sort_choice_re):
+                    log(f"  {row['id']}: could not switch to All comments")
+                absorb()
+
+                # Stop here when the thread is already complete, instead of
+                # scrolling an exhausted page to prove it. The loop below only
+                # exits after COMMENT_IDLE_ROUNDS consecutive rounds that add
+                # nothing, so a short post -- and most are short -- paid three
+                # no-op scroll-and-wait rounds, about 7s, every single time.
+                # Measured over 2,260 posts: fires on 35% of them, and takes
+                # the pass from 32.9s to 24.2s per post.
+                #
+                # Measured, not assumed: an earlier version tested this before
+                # the sort switch, on the theory that the permalink render
+                # already delivered short threads. It never fired. The comment
+                # payload does not arrive until that interaction, so the check
+                # has to come after it.
                 #
                 # The test is exactly the one the queue uses to decide a post
-                # still needs work, so this can never skip something the next
-                # run would re-open. It also makes FEWER requests rather than
-                # more, which matters when the constraint is the account rather
-                # than the pipe.
-                absorb()
+                # still needs work, so it cannot skip anything the next run
+                # would re-open.
                 have = store.db.execute(
                     "SELECT COUNT(*) FROM comments WHERE post_id=?", (row["id"],)
                 ).fetchone()[0]
                 if have >= (row["comment_count"] or 0):
                     short_circuited += 1
                 else:
-                    if not force_all_comments(page, sort_button_re, sort_choice_re):
-                        log(f"  {row['id']}: could not switch to All comments")
-                    absorb()
                     # Facebook paginates top-level comments by SCROLL, not by a
                     # button -- a permalink renders only the first slice and loads
                     # the next as the viewport nears the end of the thread. Clicking
@@ -485,7 +490,7 @@ def cmd_comments(args) -> None:
             if args.media:
                 drain_media(ctx, store)
             if i % 10 == 0:
-                log(f"{i}/{len(rows)} posts -- {store.counts()}")
+                log(f"{i}/{len(rows)} posts, {short_circuited} complete on open -- {store.counts()}")
             time.sleep(jitter(args.delay_min, args.delay_max))
         log(f"done: {store.counts()}; {short_circuited}/{len(rows)} complete on open")
     finally:
