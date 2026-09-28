@@ -150,22 +150,43 @@ def main():
     sample = out.execute(
         "SELECT id, kind, text FROM redacted ORDER BY random() LIMIT ?", (args.sample,)
     ).fetchall()
-    missed = 0
-    mention_lead = 0
-    lead_re = re.compile(r"^[A-Z][a-z]+\s+[A-Z][a-z]+\b")
+    # Clinicians are exempt by design, so counting them as misses would make
+    # the redactor look broken and invite loosening it. They are reported, but
+    # on their own line.
+    keep_l = {k.lower() for k in keep}
+    missed = clinician_kept = 0
+    mention_lead = lead_phrase = 0
+    lead_re = re.compile(r"^([A-Z][a-z]+\s+[A-Z][a-z]+)\b")
     for _id, kind, text in sample:
-        if residual(text, full):
-            missed += 1
-        # The specific high-risk shape: an @-mention prefix opening a reply.
-        if kind == "comment" and lead_re.match(text or ""):
-            mention_lead += 1
+        hits = residual(text, full)
+        if hits:
+            if all(h.lower() in keep_l for h in hits):
+                clinician_kept += 1
+            else:
+                missed += 1
+        # The high-risk shape is an @-mention prefix opening a reply. Matching
+        # two capitalised words alone does not measure that -- across the full
+        # corpus it flagged 1,258 items, of which 1,258 were ordinary phrases
+        # like "Blood Zinc" and "Nordic Calm". Only count a lead that is
+        # actually a name we know, and not one we deliberately keep.
+        if kind == "comment":
+            m = lead_re.match(text or "")
+            if m:
+                phrase = m.group(1)
+                if phrase.lower() in keep_l:
+                    pass                      # a clinician, deliberate
+                elif phrase in full:
+                    mention_lead += 1         # genuine leak
+                else:
+                    lead_phrase += 1          # ordinary capitalised phrase
     total = out.execute("SELECT count(*) FROM redacted").fetchone()[0]
+    n = max(len(sample), 1)
     print(f"\n  redacted rows:            {total}")
     print(f"  sampled for recall:       {len(sample)}")
-    print(f"  with a surviving name:    {missed}"
-          f"  ({100*missed/max(len(sample),1):.2f}%)")
-    print(f"  replies still opening with a capitalised pair: {mention_lead}"
-          f"  ({100*mention_lead/max(len(sample),1):.2f}%)")
+    print(f"  surviving MEMBER name:    {missed}  ({100*missed/n:.2f}%)   <- the number that matters")
+    print(f"  surviving clinician name: {clinician_kept}  (deliberate, not a miss)")
+    print(f"  reply opening with a member name: {mention_lead}  ({100*mention_lead/n:.2f}%)")
+    print(f"  reply opening with an ordinary capitalised phrase: {lead_phrase}  (not a leak)")
     print("\n  De-identified, NOT anonymous. Towns outside a locative preposition")
     print("  survive, and clinical narrative re-identifies on its own.")
 
