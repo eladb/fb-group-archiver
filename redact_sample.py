@@ -251,9 +251,21 @@ def redact(text, lexicon_res, provider_patterns=()):
 
 
 def residual(text, full_names):
-    """Names still present after redaction -- the honest recall measure."""
+    """Names still present after redaction -- the honest recall measure.
+
+    Two-stage on purpose. The substring scan is the fast filter across
+    thousands of names; the word-boundary check then discards the ones that
+    only matched inside other words. Without that second stage a short name
+    like "An Le" is "found" inside "scan level", and the miss rate reads
+    several percent when the true figure is zero -- which is worse than no
+    measure at all, because it invites loosening a redactor that is working.
+    """
     low = (text or "").lower()
-    return [n for n in full_names if len(n) > 4 and n.lower() in low]
+    maybe = [n for n in full_names if len(n) > 4 and n.lower() in low]
+    if not maybe:
+        return []
+    return [n for n in maybe
+            if re.search(rf"\b{re.escape(n)}\b", text or "", re.IGNORECASE)]
 
 
 CSS = """
