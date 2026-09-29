@@ -19,6 +19,7 @@ import gzip
 import html
 import json
 import pathlib
+import difflib
 import re
 import sqlite3
 
@@ -54,17 +55,132 @@ REGIONS = [
     "France","Spain","Italy","Netherlands","Sweden","Norway","Denmark",
 ]
 
+# A handful of REGIONS entries are also ordinary words or given names, so they
+# only count when capitalised. Everything else matches in any case, which is what
+# lets "OREGON!!" through the door -- the region pattern used to be
+# case-sensitive, so a shouted state name survived redaction entirely.
+CASE_SENSITIVE_REGIONS = {
+    "jersey", "mexico", "york", "carolina", "dakota", "hampshire",
+    "georgia", "virginia", "washington", "wales", "ireland", "israel",
+}
+
+# Towns large enough to narrow a family down, for the bare-mention rule. Names
+# that are also common words or common given names are deliberately absent --
+# Mobile, Reading, Jackson, Charlotte, Phoenix, Aurora, Madison, Salem, Eugene,
+# Victoria, Independence, Hope, Columbus, Springfield -- because redacting "we
+# are still full of hope" destroys the sentence to protect nobody.
+CITIES = [
+    "Albuquerque","Atlanta","Austin","Baltimore","Bangor","Birmingham","Boise",
+    "Boston","Bridgeport","Buffalo","Charleston","Chattanooga","Chicago",
+    "Cincinnati","Cleveland","Dallas","Denver","Detroit","Edmonton","Fresno",
+    "Glasgow","Hartford","Honolulu","Houston","Indianapolis","Jacksonville",
+    "Knoxville","Lexington","Louisville","Manchester","Memphis","Miami",
+    "Milwaukee","Minneapolis","Montreal","Nashville","Omaha","Orlando","Ottawa",
+    "Philadelphia","Pittsburgh","Portland","Raleigh","Sacramento","Seattle",
+    "Spokane","Tampa","Toronto","Tucson","Tulsa","Vancouver","Winnipeg",
+]
+
+GAZETTEER = [r.lower() for r in REGIONS] + [c.lower() for c in CITIES]
+# Indexed by first letter and length so the fuzzy pass compares a token against a
+# handful of candidates rather than the whole list -- this runs over 157k
+# messages, and difflib is not cheap.
+_GAZ_INDEX = {}
+for _g in GAZETTEER:
+    _GAZ_INDEX.setdefault((_g[0], len(_g) // 3), []).append(_g)
+
+
+def _looks_like(token):
+    """A gazetteer entry this token is probably a misspelling of, or None.
+
+    Exists because a place name reaches the redactor exactly as it was typed:
+    "in <misspelled city> <misspelled state>" survived every rule -- lowercase defeated the
+    locative capture, and the misspelling defeated the region list. Fuzzy
+    matching only runs where a place is already likely (after a locative
+    preposition), so the looseness cannot leak into ordinary prose.
+    """
+    low = token.lower().strip(".,!?'’")
+    if len(low) < 5:
+        return None
+    for bucket in (len(low) // 3 - 1, len(low) // 3, len(low) // 3 + 1):
+        for cand in _GAZ_INDEX.get((low[0], bucket), ()):
+            if low == cand:
+                return cand
+            if abs(len(low) - len(cand)) <= 2 and \
+                    difflib.SequenceMatcher(None, low, cand).ratio() >= 0.82:
+                return cand
+    return None
+
+
+def _region_sub(m):
+    """Redact a region in any case except all-lowercase for the ambiguous ones."""
+    word = m.group(0)
+    if word.lower() in CASE_SENSITIVE_REGIONS and word[0].islower():
+        return word
+    return "[PLACE]"
+
+
+# Capitalised words that follow "in"/"from"/"near" constantly and are not places.
+# Without this the rule turns "in January" into "in [PLACE]", which protects
+# nobody and destroys the timing the annotation layer asks about -- SAFE already
+# NOT_A_NAME already holds the months and weekdays, so this covers the rest.
+LOCATIVE_STOP = {
+    "facebook", "google", "amazon", "youtube", "instagram", "tiktok", "zoom",
+    "reddit", "target", "walmart", "costco", "cvs", "walgreens", "amazon",
+    "grandma", "grandpa", "granny", "nana", "papa", "auntie", "uncle",
+    "kindergarten", "preschool", "daycare", "school", "college", "university",
+    "church", "temple", "synagogue", "home", "hospital", "urgent", "care",
+    "english", "spanish", "hebrew", "french", "german", "math", "science",
+    "christmas", "easter", "thanksgiving", "hanukkah", "passover", "halloween",
+    "week", "weeks", "day", "days", "month", "months", "year", "years",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "remission", "bed", "tears", "pain", "crisis", "hell", "flare", "person",
+}
+
+
+def _locative_sub(m):
+    """Redact what follows a locative preposition.
+
+    Capitalised words go as before. A lowercase word goes only when it fuzzy-
+    matches the gazetteer, so "in bed" and "from school" are untouched while
+    "in sacramneto" is not.
+    """
+    prep, rest = m.group(1), m.group(2)
+    out = []
+    for tok in rest.split():
+        bare = tok.lower().strip(".,!?'’")
+        if bare in LOCATIVE_STOP or bare in NOT_A_NAME:
+            out.append(tok)
+        elif tok[:1].isupper() or _looks_like(tok):
+            out.append("[PLACE]")
+        else:
+            out.append(tok)
+    # Collapse "[PLACE] [PLACE]" from "sacramneto califrnia".
+    collapsed = []
+    for tok in out:
+        if tok == "[PLACE]" and collapsed and collapsed[-1] == "[PLACE]":
+            continue
+        collapsed.append(tok)
+    return f"{prep} " + " ".join(collapsed)
+
+
 # Things a name lexicon cannot know about, removed by shape instead.
 PATTERNS = [
     (re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.]+\b"), "[EMAIL]"),
     (re.compile(r"\b(?:\+?\d[\d\-.\s()]{7,}\d)\b"), "[PHONE]"),
     (re.compile(r"https?://\S+"), "[LINK]"),
-    # Named regions.
-    (re.compile(r"\b(?:" + "|".join(re.escape(r) for r in REGIONS) + r")\b"), "[PLACE]"),
+    # Named regions, in any case -- see _region_sub for the ambiguous ones.
+    (re.compile(r"\b(?:" + "|".join(re.escape(r) for r in REGIONS) + r")\b",
+                re.IGNORECASE), _region_sub),
+    # Bare town mentions, capitalised only. "the Tulsa area" carries no locative
+    # preposition, which is how it used to survive.
+    (re.compile(r"\b(?:" + "|".join(re.escape(c) for c in CITIES) + r")\b"),
+     "[PLACE]"),
     # "in <Town>", "near <Town>", "from <Town>" -- a place after a locative
-    # preposition, which is how people actually write where they are.
-    (re.compile(r"\b(in|near|from|outside|around)\s+([A-Z][\w'’-]{2,}(?:\s+[A-Z][\w'’-]{2,})?)"
-                r"(?=[\s,.!?])"), r"\1 [PLACE]"),
+    # preposition, which is how people actually write where they are. Lowercase
+    # and misspelled forms are handled in _locative_sub.
+    (re.compile(r"\b(in|near|from|outside|around)\s+"
+                r"([\w'’-]{3,}(?:\s+[\w'’-]{3,})?)(?=[\s,.!?])"),
+     _locative_sub),
 ]
 
 
@@ -245,8 +361,13 @@ def redact(text, lexicon_res, provider_patterns=()):
     for rx, repl in lexicon_res:
         text, n = rx.subn(repl, text)
         hits += n
-    # Collapse runs the passes leave behind: "[NAME] [NAME]" is one person.
-    text = re.sub(r"(\[NAME\]\s*){2,}", "[NAME] ", text)
+    # Collapse runs the passes leave behind: "[NAME] [NAME]" is one person, and
+    # "[PLACE] [PLACE]" is one place -- "New Jersey" gets hit by the region rule
+    # and the locative rule in turn.
+    # Consume only the whitespace BETWEEN repeats, not the trailing space -- the
+    # greedy form turns "in New Jersey?" into "in [PLACE] ?".
+    text = re.sub(r"\[NAME\](?:\s*\[NAME\])+", "[NAME]", text)
+    text = re.sub(r"\[PLACE\](?:\s*\[PLACE\])+", "[PLACE]", text)
     return text, hits
 
 
