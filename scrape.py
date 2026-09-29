@@ -162,11 +162,59 @@ def in_group(post: dict, group_id: str) -> bool:
     return f"/groups/{group_id}/" in url or f"/groups/{group_id}" == url.rstrip("/")
 
 
+# Facebook's GraphQL returns HTTP 200 with an `errors` array, so a refused query
+# is indistinguishable from an empty one unless someone looks. Nothing did, and
+# the cost was a day: on 2026-09-28 every comment query came back
+# {"errors":[{"code":1675004,"message":"Rate limit exceeded","severity":
+# "CRITICAL"}]} and the crawler kept going for 90 minutes, logging
+# "2430/8001 posts" as though it were progressing, burning the limit further.
+# It was then diagnosed as an account block needing identity re-verification --
+# it was a rate limit, and the session was never in trouble.
+RATE_LIMIT_CODES = {1675004}
+
+
+def graphql_errors(payload):
+    """The error objects in a GraphQL payload, if any. Message and code only."""
+    errs = payload.get("errors") if isinstance(payload, dict) else None
+    if not isinstance(errs, list):
+        return []
+    return [(e.get("code"), (e.get("message") or "")[:120],
+             e.get("severity") or "") for e in errs if isinstance(e, dict)]
+
+
+class RateLimited(Exception):
+    """Facebook refused the query for rate reasons. Backing off is the only fix;
+    re-authenticating does nothing, and retrying immediately makes it worse."""
+
+
+def check_for_refusal(payload, friendly=""):
+    """Raise on a rate-limit refusal, and return other errors for logging.
+
+    Deliberately loud and deliberately fatal for rate limits. A silent
+    zero-result is the failure mode that cost a day here, so the one thing this
+    must not do is let the caller carry on as if the request had succeeded.
+    """
+    errs = graphql_errors(payload)
+    if not errs:
+        return []
+    for code, msg, sev in errs:
+        if code in RATE_LIMIT_CODES or "rate limit" in msg.lower():
+            raise RateLimited(
+                f"{friendly or 'query'}: {msg} (code {code}, {sev}). "
+                f"This is a rate limit, not a block and not a login problem -- "
+                f"wait it out and resume with a longer delay.")
+    return errs
+
+
 def ingest(store: Store, capture: Capture, group_id: str, known: set) -> int:
     """Persist everything captured so far. Returns the count of new posts."""
     new_posts = 0
     for url, friendly, payload in capture.drain():
         raw_ref = store.append_raw(url, friendly, payload)
+        # Raw is stored first, so the evidence survives even when we abort.
+        for code, msg, sev in check_for_refusal(payload, friendly):
+            print(f"  graphql error on {friendly}: {msg} (code {code}, {sev})",
+                  flush=True)
         posts, comments = harvest(payload, group_id, raw_ref)
         for p in posts:
             if not in_group(p, group_id):
@@ -404,6 +452,9 @@ def cmd_comments(args) -> None:
                 fresh = 0
                 for url, friendly, payload in capture.drain():
                     raw_ref = store.append_raw(url, friendly, payload)
+                    for code, msg, sev in check_for_refusal(payload, friendly):
+                        print(f"  graphql error on {friendly}: {msg} "
+                              f"(code {code}, {sev})", flush=True)
                     posts, comments = harvest(payload, group_id, raw_ref)
                     for p_ in posts:
                         if in_group(p_, group_id):
@@ -785,7 +836,17 @@ def main():
         p.set_defaults(func=fn)
 
     args = ap.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except RateLimited as e:
+        # Exit code 3, distinct from a crash, so archive-runner.sh can tell the
+        # difference between "stop and wait" and "something is broken". Every
+        # pass here is resumable, so stopping costs only the requests in flight.
+        sys.exit(f"\nRATE LIMITED -- stopped on purpose.\n  {e}\n\n"
+                 f"  Not a block. Not a login problem: check the session with\n"
+                 f"  `scrape.py status` before assuming otherwise.\n"
+                 f"  Wait for the window to clear, then resume with a longer\n"
+                 f"  --delay-min/--delay-max. Progress is kept.\n")
 
 
 if __name__ == "__main__":
