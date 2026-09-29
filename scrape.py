@@ -182,6 +182,9 @@ def graphql_errors(payload):
              e.get("severity") or "") for e in errs if isinstance(e, dict)]
 
 
+RATE_LIMIT_SEEN = []
+
+
 class RateLimited(Exception):
     """Facebook refused the query for rate reasons. Backing off is the only fix;
     re-authenticating does nothing, and retrying immediately makes it worse."""
@@ -199,6 +202,7 @@ def check_for_refusal(payload, friendly=""):
         return []
     for code, msg, sev in errs:
         if code in RATE_LIMIT_CODES or "rate limit" in msg.lower():
+            RATE_LIMIT_SEEN.append((friendly, code, msg))
             raise RateLimited(
                 f"{friendly or 'query'}: {msg} (code {code}, {sev}). "
                 f"This is a rate limit, not a block and not a login problem -- "
@@ -443,6 +447,11 @@ def cmd_comments(args) -> None:
         for i, row in enumerate(rows, 1):
             if args.max_posts and i > args.max_posts:
                 break
+            if RATE_LIMIT_SEEN:
+                raise RateLimited(
+                    f"{len(RATE_LIMIT_SEEN)} refused queries "
+                    f"(e.g. {RATE_LIMIT_SEEN[0][2]} on {RATE_LIMIT_SEEN[0][0]}); "
+                    f"stopped after {i-1} posts")
             def absorb() -> int:
                 """Persist whatever has been captured; return the new-comment count.
 
@@ -533,6 +542,11 @@ def cmd_comments(args) -> None:
                         if time.time() > deadline:
                             log(f"  {row['id']}: time budget reached, moving on")
                             break
+            except RateLimited:
+                # Must precede the blanket catch below. `except Exception` also
+                # catches this, which is exactly how the first version of this
+                # fix managed to detect the refusal and then discard it.
+                raise
             except Exception as exc:
                 log(f"  {row['id']}: {str(exc)[:120]}")
 
