@@ -56,6 +56,13 @@ DEFAULT_SORT_BUTTON = r"most relevant|newest|all comments|top comments|הכי ר
 DEFAULT_SORT_CHOICE = r"^\s*(all comments|כל התגובות)"
 
 # Comment threads load in slices; these bound the per-post effort.
+# Openings that add nothing before a post is retired from the queue. Three, not
+# one: a rate-limited or momentarily broken sweep is indistinguishable from an
+# exhausted thread, and retiring a post on one bad night silently drops data.
+# `scrape.py comments --retry-retired` clears the counters after a fix that
+# plausibly changes what is fetchable.
+MAX_SWEEP_ATTEMPTS = 3
+
 EXPANDS_PER_ROUND = 6      # reply expanders clicked before scrolling again
 COMMENT_IDLE_ROUNDS = 3    # consecutive rounds yielding no new comments
 POST_TIME_BUDGET = 150     # seconds; hard cap so one odd page cannot stall a run
@@ -412,6 +419,8 @@ def cmd_crawl(args) -> None:
 def cmd_comments(args) -> None:
     """Second pass: open each post permalink and expand its comment threads."""
     store = Store(Path(args.out))
+    if getattr(args, "retry_retired", False):
+        log(f"cleared {store.reset_comment_sweeps()} sweep records")
     pw, ctx = open_browser(Path(args.profile), headless=args.headless)
     expand_re = re.compile(args.expand_pattern, re.I)
     sort_button_re = re.compile(args.sort_pattern, re.I)
@@ -424,22 +433,28 @@ def cmd_comments(args) -> None:
         capture = Capture()
         capture.attach(page)
 
+        # `have < comment_count` alone never terminates: comment_count counts
+        # replies, hidden and deleted comments that cannot be fetched, so a
+        # fully-swept post stays a comment or two short of its own count for
+        # ever, and newest-first parks that residue at the head of the queue
+        # where every restart re-walks it. So the queue also asks what has been
+        # TRIED, and retires a post after MAX_SWEEP_ATTEMPTS openings that added
+        # nothing. Attempts rather than a verdict, because a rate-limited request
+        # and an exhausted thread look identical from here.
         rows = store.db.execute(
-            """SELECT p.id, p.url, p.comment_count,
-                      (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id) AS have
-               FROM posts p
-               WHERE p.comment_count > 0
-                 AND p.url IS NOT NULL
-                 AND p.url LIKE '%/groups/%'
-                 AND have < p.comment_count
-               -- Never-fetched posts first. A post whose capture came within a
-               -- comment or two of its reported count never satisfies
-               -- `have < comment_count` (the count and what is fetchable differ
-               -- slightly), so it stays queued forever. Newest-first ordering
-               -- then puts that permanent residue at the head of the queue, and
-               -- every restart re-walks it, re-fetching comments already stored
-               -- and recording nothing new.
-               ORDER BY (have > 0), p.created_at DESC"""
+            f"""SELECT p.id, p.url, p.comment_count,
+                       (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id) AS have,
+                       COALESCE(s.attempts, 0) AS attempts
+                FROM posts p
+                LEFT JOIN comment_sweeps s ON s.post_id = p.id
+                WHERE p.comment_count > 0
+                  AND p.url IS NOT NULL
+                  AND p.url LIKE '%/groups/%'
+                  AND have < p.comment_count
+                  AND (s.attempts IS NULL
+                       OR s.attempts < {MAX_SWEEP_ATTEMPTS}
+                       OR s.last_gain > 0)
+                ORDER BY (have > 0), attempts, p.created_at DESC"""
         ).fetchall()
         if getattr(args, "shuffle", False):
             # The ordering above is deterministic, so a bounded run always walks
@@ -557,6 +572,11 @@ def cmd_comments(args) -> None:
                 log(f"  {row['id']}: {str(exc)[:120]}")
 
             absorb()
+            have_after = store.db.execute(
+                "SELECT COUNT(*) FROM comments WHERE post_id=?", (row["id"],)
+            ).fetchone()[0]
+            store.record_comment_sweep(row["id"], have_after,
+                                       have_after - (row["have"] or 0))
             store.commit()
             if args.media:
                 drain_media(ctx, store)
@@ -819,6 +839,9 @@ def main():
     p.add_argument("--max-posts", type=int, default=0)
     p.add_argument("--max-expansions", type=int, default=25,
                    help="max 'view more comments' clicks per post")
+    p.add_argument("--retry-retired", action="store_true",
+                   help="clear the sweep counters so posts retired after "
+                        f"{MAX_SWEEP_ATTEMPTS} fruitless openings are queued again")
     p.add_argument("--shuffle", action="store_true",
                    help="walk the queue in random order -- for bounded sampling, "
                         "where the deterministic head is not representative")

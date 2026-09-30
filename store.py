@@ -123,6 +123,31 @@ CREATE TABLE IF NOT EXISTS state (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- One row per post the comments pass has opened.
+--
+-- Without this the queue can only ask "have < comment_count", and that question
+-- has no terminating answer: Facebook's comment_count includes replies, hidden
+-- and deleted comments that are not fetchable, so a fully-swept post sits a
+-- comment or two short of its own count forever. Newest-first ordering then
+-- parks that residue at the head of the queue, where every restart re-walks it.
+-- Measured: a run on 2026-09-28 walked 2,430 posts and collected nothing, and
+-- three bounded probes afterwards reported the same four unfetchable posts as
+-- the state of the whole account.
+--
+-- So the queue needs to know what has been TRIED, not only what is incomplete.
+-- Attempts are counted rather than a verdict being recorded, because a failed
+-- sweep can be transient -- a rate-limited request looks identical to an
+-- exhausted thread from here, and permanently retiring a post on one bad night
+-- would silently drop data.
+CREATE TABLE IF NOT EXISTS comment_sweeps (
+    post_id      TEXT PRIMARY KEY,
+    attempts     INTEGER DEFAULT 0,
+    last_attempt INTEGER,
+    last_have    INTEGER,   -- comments stored for this post after that attempt
+    last_gain    INTEGER    -- how many that attempt added; 0 means nothing left
+);
+CREATE INDEX IF NOT EXISTS comment_sweeps_attempts ON comment_sweeps(attempts);
 """
 
 
@@ -334,6 +359,34 @@ class Store:
             )
 
     # ---- misc --------------------------------------------------------
+
+    def record_comment_sweep(self, post_id: str, have: int, gain: int) -> None:
+        """Note that a comments pass opened this post, and what it got.
+
+        Called for every post the pass opens, including the ones that fail --
+        that is the point. A post nobody can complete has to become visible as
+        tried, or it blocks the queue forever.
+        """
+        self.db.execute(
+            """INSERT INTO comment_sweeps (post_id, attempts, last_attempt,
+                                           last_have, last_gain)
+               VALUES (?, 1, ?, ?, ?)
+               ON CONFLICT(post_id) DO UPDATE SET
+                 attempts     = attempts + 1,
+                 last_attempt = excluded.last_attempt,
+                 last_have    = excluded.last_have,
+                 last_gain    = excluded.last_gain""",
+            (post_id, int(time.time()), have, gain))
+
+    def reset_comment_sweeps(self) -> int:
+        """Clear the attempt counters, putting retired posts back in the queue.
+
+        For after a fix that plausibly changes what is fetchable -- a new sort
+        pattern, say. Returns how many rows were dropped."""
+        n = self.db.execute("SELECT COUNT(*) FROM comment_sweeps").fetchone()[0]
+        self.db.execute("DELETE FROM comment_sweeps")
+        self.db.commit()
+        return n
 
     def get_state(self, key: str, default=None):
         row = self.db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
