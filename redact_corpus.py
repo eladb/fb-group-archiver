@@ -89,7 +89,12 @@ def main():
     ap.add_argument("--out", default=str(pathlib.Path.home()
                     / ".local/share/pandas-agent/insight.db"))
     ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--rebuild", action="store_true")
+    ap.add_argument("--rebuild", action="store_true",
+                    help="discard the output AND rebuild the name lexicon from "
+                         "every raw payload (slow)")
+    ap.add_argument("--redo", action="store_true",
+                    help="re-redact every item with the cached lexicon -- for a "
+                         "change to the redaction RULES rather than the names")
     ap.add_argument("--verify-only", action="store_true")
     ap.add_argument("--sample", type=int, default=2000,
                     help="items to re-scan for surviving names")
@@ -103,7 +108,7 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out = sqlite3.connect(out_path)
     out.executescript(SCHEMA)
-    if args.rebuild:
+    if args.rebuild or args.redo:
         out.execute("DELETE FROM redacted")
         out.commit()
         print("  previous output discarded")
