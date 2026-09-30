@@ -20,14 +20,27 @@ before_raw=$(q "select coalesce(max(offset),-1) from raw")
 before_comments=$(q "select count(*) from comments")
 
 # Bounded every way available: 2 posts, no media, generous delay, hard timeout.
+# Keep the output. The first version sent it to /dev/null and then logged
+# "rc=1 raw=+0 UNCLEAR" three times running -- a probe that reports only that it
+# failed is the same silent-progress trap this whole exercise was about.
+ERR="$(dirname "$LOG")/rate-limit-probe.last-run.txt"
 set +e
-timeout 300 "$PY" "$REPO/scrape.py" comments \
-  --max-posts 2 --no-media --headless --delay-min 10 --delay-max 20 \
-  >/dev/null 2>&1
+# --profile ABSOLUTE, not the default relative ".chrome-profile". Under systemd
+# the working directory is not the repo, so the relative form resolved to an
+# empty directory, Chromium opened a fresh profile, and the run died on
+# "Not logged in" without ever reaching Facebook -- three scheduled probes
+# reporting UNCLEAR while the session was perfectly healthy.
+# --profile is a TOP-LEVEL argument, so it precedes the subcommand.
+timeout 300 "$PY" "$REPO/scrape.py" \
+  --profile "$REPO/.chrome-profile" comments \
+  --max-posts 4 --no-media --headless --delay-min 10 --delay-max 20 \
+  >"$ERR" 2>&1
 rc=$?
 set -e
 
 after_raw=$(q "select coalesce(max(offset),-1) from raw")
+comment_queries=$(q "select count(*) from raw where offset > $before_raw \
+  and friendly like '%Comment%'")
 after_comments=$(q "select count(*) from comments")
 new_comments=$(( after_comments - before_comments ))
 
@@ -64,11 +77,24 @@ if [ "$refusals" -gt 0 ]; then
   verdict="LIMITED ($refusals refused queries)"
 elif [ "$new_comments" -gt 0 ]; then
   verdict="CLEAR ($new_comments comments collected) -- safe to resume"
+elif [ "$comment_queries" -eq 0 ]; then
+  # Nothing was asked, so nothing was refused. Says nothing about the limit.
+  verdict="NO SIGNAL (no comment query fired; sampled posts may be complete already)"
 else
-  verdict="UNCLEAR (no refusals, no comments; look at the payloads by hand)"
+  # Queries went out, came back without an error, and carried no comments. Not a
+  # rate limit -- worth a look at the payloads before assuming anything.
+  verdict="ODD ($comment_queries comment queries, no refusals, no comments)"
 fi
 
 echo "$(date -Is)  rc=$rc raw=+$(( after_raw - before_raw )) comments=+$new_comments  $verdict" >> "$LOG"
+
+# A non-zero exit with nothing captured means it never got as far as Facebook,
+# which is a local fault rather than a rate-limit answer. Put the last line in
+# the log so the log alone is enough to tell those apart.
+if [ "$rc" -ne 0 ] && [ "$(( after_raw - before_raw ))" -eq 0 ]; then
+  echo "    did not reach Facebook -- last line: $(tail -1 "$ERR" 2>/dev/null | cut -c1-160)" >> "$LOG"
+  echo "    full output: $ERR" >> "$LOG"
+fi
 
 # Only the CLEAR case needs a human, so only that one is loud.
 case "$verdict" in
