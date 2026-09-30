@@ -33,7 +33,7 @@ set +e
 # --profile is a TOP-LEVEL argument, so it precedes the subcommand.
 timeout 300 "$PY" "$REPO/scrape.py" \
   --profile "$REPO/.chrome-profile" comments \
-  --max-posts 4 --no-media --headless --delay-min 10 --delay-max 20 \
+  --max-posts 4 --shuffle --no-media --headless --delay-min 10 --delay-max 20 \
   >"$ERR" 2>&1
 rc=$?
 set -e

@@ -441,6 +441,12 @@ def cmd_comments(args) -> None:
                -- and recording nothing new.
                ORDER BY (have > 0), p.created_at DESC"""
         ).fetchall()
+        if getattr(args, "shuffle", False):
+            # The ordering above is deterministic, so a bounded run always walks
+            # the same head of the queue. Fine for a full pass, useless for a
+            # sample: a 4-post probe measured the same 4 posts every time and
+            # reported their quirks as the state of the account.
+            random.shuffle(rows)
         log(f"{len(rows)} posts with unfetched comments")
 
         short_circuited = 0
@@ -813,6 +819,9 @@ def main():
     p.add_argument("--max-posts", type=int, default=0)
     p.add_argument("--max-expansions", type=int, default=25,
                    help="max 'view more comments' clicks per post")
+    p.add_argument("--shuffle", action="store_true",
+                   help="walk the queue in random order -- for bounded sampling, "
+                        "where the deterministic head is not representative")
     p.add_argument("--sort-pattern", default=DEFAULT_SORT_BUTTON,
                    help="regex matching the comment-ordering button in your UI language")
     p.add_argument("--sort-choice", default=DEFAULT_SORT_CHOICE,
