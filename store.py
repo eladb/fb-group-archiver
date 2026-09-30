@@ -160,6 +160,18 @@ class Store:
         self.legacy_raw = self.dir / LEGACY_RAW
         self._chunk = None
         self.db = sqlite3.connect(self.dir / "archive.db")
+        # Wait for a competing reader instead of dying on it. This database is in
+        # rollback-journal mode, so a long read -- redact_corpus.py scanning the
+        # corpus, say -- blocks writers; with no timeout SQLite raises
+        # "database is locked" immediately and the caller falls over. That killed
+        # a multi-day comments pass on 2026-09-30, ten minutes after a redaction
+        # re-run started beside it.
+        #
+        # Two minutes rather than seconds: the scans that cause this run over
+        # 157k rows, and a crawl that pauses is strictly better than one that
+        # stops. Analysis tooling reads this file often, so a writer that cannot
+        # share is a writer that will keep failing.
+        self.db.execute("PRAGMA busy_timeout = 120000")
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
         self.db.commit()
