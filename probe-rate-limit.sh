@@ -96,8 +96,54 @@ if [ "$rc" -ne 0 ] && [ "$(( after_raw - before_raw ))" -eq 0 ]; then
   echo "    full output: $ERR" >> "$LOG"
 fi
 
-# Only the CLEAR case needs a human, so only that one is loud.
+# ---------------------------------------------------------------- auto-resume
+#
+# Gated on a marker file, so this stays a read-only diagnostic unless somebody
+# has explicitly asked for the crawl to be restarted when the window opens.
+# A probe that silently starts multi-day jobs is not a probe.
+#
+# Attempts are capped. If the limit is still effectively closed, a resume will
+# trip it again within minutes, and an uncapped loop would spend the whole
+# window re-tripping it -- which is how you turn a rate limit into a longer
+# rate limit.
+RESUME_MARKER="$LOG_DIR/.auto-resume-comments"
+ATTEMPTS_FILE="$LOG_DIR/.auto-resume-attempts"
+MAX_RESUMES=5
+
 case "$verdict" in
-  CLEAR*) echo "rate limit has cleared -- resume with:"
-          echo "  cd $REPO && ./.venv/bin/python scrape.py comments --delay-min 8 --delay-max 20" ;;
+  CLEAR*)
+    echo "rate limit has cleared"
+    if [ ! -e "$RESUME_MARKER" ]; then
+      echo "  auto-resume not enabled; resume by hand with:"
+      echo "  cd $REPO && ./.venv/bin/python scrape.py comments --shuffle --delay-min 20 --delay-max 45"
+      exit 0
+    fi
+    n=$(cat "$ATTEMPTS_FILE" 2>/dev/null || echo 0)
+    if [ "$n" -ge "$MAX_RESUMES" ]; then
+      MSG="auto-resume gave up after $n attempts -- needs a human"
+      echo "$(date -Is)  $MSG" >> "$LOG_DIR/comments-finish.log"
+      command -v notify-send >/dev/null && notify-send -u critical "PANDAS crawl" "$MSG"
+      exit 1
+    fi
+    echo $((n + 1)) > "$ATTEMPTS_FILE"
+
+    # Slower than the run that earned the limit: 43 hours at ~47s/post tripped
+    # it, so the delay goes up rather than staying put and hoping.
+    RESUME_LOG="$LOG_DIR/comments-resume-$(date +%Y%m%d-%H%M).log"
+    cd "$REPO" || exit 1
+    nohup ./.venv/bin/python scrape.py comments \
+      --shuffle --no-media --headless --delay-min 20 --delay-max 45 \
+      > "$RESUME_LOG" 2>&1 &
+    sleep 10
+    # The sleep lock takes itself only while a crawl is running, so it has to be
+    # started after, not before.
+    systemctl --user start pandas-inhibit-sleep.service 2>/dev/null || true
+    # Let the finish watcher fire again for this new run.
+    rm -f "$LOG_DIR/.comments-finish-notified"
+
+    MSG="comments pass auto-resumed (attempt $((n+1))/$MAX_RESUMES) -- $COMMENTS comments so far"
+    echo "$(date -Is)  $MSG  log=$(basename "$RESUME_LOG")" >> "$LOG_DIR/comments-finish.log"
+    command -v notify-send >/dev/null && notify-send "PANDAS crawl" "$MSG"
+    echo "  $MSG"
+    ;;
 esac
