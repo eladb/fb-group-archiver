@@ -11,8 +11,13 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="$REPO/.venv/bin/python"
 DB="$REPO/archive/archive.db"
-LOG="${PANDAS_LOG_DIR:-$HOME/.local/share/pandas-agent}/rate-limit-probe.log"
-mkdir -p "$(dirname "$LOG")"
+# LOG_DIR as its own variable, because the auto-resume block below needs the
+# directory too. It referenced $LOG_DIR while only $LOG existed, and `set -u`
+# killed the script immediately after it wrote "CLEAR" -- so the window opened,
+# the probe saw it, and the crawl did not resume for 19 hours.
+LOG_DIR="${PANDAS_LOG_DIR:-$HOME/.local/share/pandas-agent}"
+LOG="$LOG_DIR/rate-limit-probe.log"
+mkdir -p "$LOG_DIR"
 
 q() { sqlite3 "file:$DB?mode=ro" "$1"; }
 
@@ -141,7 +146,7 @@ case "$verdict" in
     # Let the finish watcher fire again for this new run.
     rm -f "$LOG_DIR/.comments-finish-notified"
 
-    MSG="comments pass auto-resumed (attempt $((n+1))/$MAX_RESUMES) -- $COMMENTS comments so far"
+    MSG="comments pass auto-resumed (attempt $((n+1))/$MAX_RESUMES) -- $after_comments comments so far"
     echo "$(date -Is)  $MSG  log=$(basename "$RESUME_LOG")" >> "$LOG_DIR/comments-finish.log"
     command -v notify-send >/dev/null && notify-send "PANDAS crawl" "$MSG"
     echo "  $MSG"
