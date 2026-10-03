@@ -888,11 +888,14 @@ def main():
         # Exit code 3, distinct from a crash, so archive-runner.sh can tell the
         # difference between "stop and wait" and "something is broken". Every
         # pass here is resumable, so stopping costs only the requests in flight.
-        sys.exit(f"\nRATE LIMITED -- stopped on purpose.\n  {e}\n\n"
-                 f"  Not a block. Not a login problem: check the session with\n"
-                 f"  `scrape.py status` before assuming otherwise.\n"
-                 f"  Wait for the window to clear, then resume with a longer\n"
-                 f"  --delay-min/--delay-max. Progress is kept.\n")
+        # sys.exit() with a string always exits 1 -- it used to be called that
+        # way, so "exit code 3" was a comment, not a fact. Print, then exit 3.
+        print(f"\nRATE LIMITED -- stopped on purpose.\n  {e}\n\n"
+              f"  Not a block. Not a login problem: check the session with\n"
+              f"  `scrape.py status` before assuming otherwise.\n"
+              f"  Wait for the window to clear, then resume with a longer\n"
+              f"  --delay-min/--delay-max. Progress is kept.\n", file=sys.stderr)
+        sys.exit(3)
 
 
 if __name__ == "__main__":
