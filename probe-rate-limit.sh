@@ -134,12 +134,17 @@ case "$verdict" in
 
     # Slower than the run that earned the limit: 43 hours at ~47s/post tripped
     # it, so the delay goes up rather than staying put and hoping.
-    RESUME_LOG="$LOG_DIR/comments-resume-$(date +%Y%m%d-%H%M).log"
-    cd "$REPO" || exit 1
-    nohup ./.venv/bin/python scrape.py comments \
-      --shuffle --no-media --headless --delay-min 20 --delay-max 45 \
-      > "$RESUME_LOG" 2>&1 &
+    # Start a SERVICE, not a background child. This probe is Type=oneshot, so
+    # systemd reaps its whole cgroup when it exits -- a nohup'd crawl launched
+    # here died within seconds of the probe finishing, twice, while the log
+    # showed only the two startup lines. pandas-comments.service has its own
+    # cgroup and outlives this script.
+    systemctl --user start pandas-comments.service || exit 1
     sleep 10
+    systemctl --user is-active --quiet pandas-comments.service || {
+      echo "comments service failed to stay up -- see journalctl --user -u pandas-comments"
+      exit 1
+    }
     # The sleep lock takes itself only while a crawl is running, so it has to be
     # started after, not before.
     systemctl --user start pandas-inhibit-sleep.service 2>/dev/null || true
@@ -147,7 +152,7 @@ case "$verdict" in
     rm -f "$LOG_DIR/.comments-finish-notified"
 
     MSG="comments pass auto-resumed (attempt $((n+1))/$MAX_RESUMES) -- $after_comments comments so far"
-    echo "$(date -Is)  $MSG  log=$(basename "$RESUME_LOG")" >> "$LOG_DIR/comments-finish.log"
+    echo "$(date -Is)  $MSG  (pandas-comments.service)" >> "$LOG_DIR/comments-finish.log"
     command -v notify-send >/dev/null && notify-send "PANDAS crawl" "$MSG"
     echo "  $MSG"
     ;;

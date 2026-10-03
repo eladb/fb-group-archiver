@@ -12,7 +12,7 @@ LOG="$(ls -t "$LOG_DIR"/comments-resume-*.log 2>/dev/null | head -1)"
 
 [ -n "$LOG" ] || exit 0
 [ -e "$MARKER" ] && exit 0                      # already told them
-pgrep -f "[s]crape.py comments" >/dev/null && exit 0   # still running
+systemctl --user is-active --quiet pandas-comments.service && exit 0  # still running
 
 COMMENTS=$(sqlite3 "file:$HOME/pandas/archive/archive.db?mode=ro" \
   "select count(*) from comments" 2>/dev/null || echo "?")

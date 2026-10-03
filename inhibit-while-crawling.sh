@@ -11,7 +11,7 @@
 # inhibitor is a thing someone has to remember to kill, and nobody does.
 set -uo pipefail
 
-if ! pgrep -f "[s]crape.py comments" >/dev/null; then
+if ! systemctl --user is-active --quiet pandas-comments.service; then
   echo "comments pass is not running -- not taking a sleep lock"
   exit 0
 fi
@@ -21,5 +21,5 @@ exec systemd-inhibit \
   --who="pandas comments pass" \
   --why="multi-day comment collection; suspending wastes the post in flight" \
   --mode=block \
-  bash -c 'while pgrep -f "[s]crape.py comments" >/dev/null; do sleep 60; done;
+  bash -c 'while systemctl --user is-active --quiet pandas-comments.service; do sleep 60; done;
            echo "comments pass ended -- releasing the sleep lock"'
