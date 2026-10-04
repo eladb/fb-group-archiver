@@ -21,6 +21,15 @@ mkdir -p "$LOG_DIR"
 
 q() { sqlite3 "file:$DB?mode=ro" "$1"; }
 
+# A running pass already answers the question, and probing alongside it means two
+# sessions against one account on one Chrome profile. On 2026-10-03 22:00 the
+# probe did exactly that, then "auto-resumed" a service that had never stopped
+# and spent one of the five resume attempts on it.
+if systemctl --user is-active --quiet pandas-comments.service; then
+  echo "$(date -Is)  SKIPPED: comments pass is running" >> "$LOG"
+  exit 0
+fi
+
 before_raw=$(q "select coalesce(max(offset),-1) from raw")
 before_comments=$(q "select count(*) from comments")
 
