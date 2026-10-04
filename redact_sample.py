@@ -148,6 +148,9 @@ def _locative_sub(m):
     out = []
     for tok in rest.split():
         bare = tok.lower().strip(".,!?'’")
+        # "Grandma's" is still Grandma. A real place keeps its redaction because
+        # the stem is looked up, not the token: "Brattleboro's" -> [PLACE].
+        bare = re.sub(r"['’]s$", "", bare)
         if bare in LOCATIVE_STOP or bare in NOT_A_NAME:
             out.append(tok)
         elif tok[:1].isupper() or _looks_like(tok):

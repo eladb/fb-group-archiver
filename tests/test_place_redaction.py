@@ -55,6 +55,8 @@ class TestOrdinaryProseIsLeftAlone:
         "We take strength from God most days.",
         "He answers in English and Spanish.",
         "She came back from Grandma on Sunday.",
+        "She stayed over from Grandma's on Sunday.",
+        "He got home from Nana’s late.",
         "He has been in bed since lunch.",
         "We have been in remission since autumn.",
         "He came home from school exhausted.",
@@ -75,6 +77,8 @@ class TestPlacesStillGo:
         ("Anyone in New Jersey?", "Jersey"),
         ("Looking for someone in Cincinnati.", "Cincinnati"),
         ("We are in Florida now.", "Florida"),
+        # Not in CITIES, so only the locative rule can catch the possessive.
+        ("We drove in from Brattleboro's suburbs.", "Brattleboro"),
     ]
 
     def test_redacted(self):
