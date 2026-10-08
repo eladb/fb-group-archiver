@@ -32,6 +32,7 @@ fi
 
 before_raw=$(q "select coalesce(max(offset),-1) from raw")
 before_comments=$(q "select count(*) from comments")
+probe_started=$(date +%s)
 
 # Bounded every way available: 2 posts, no media, generous delay, hard timeout.
 # Keep the output. The first version sent it to /dev/null and then logged
@@ -95,9 +96,22 @@ elif [ "$comment_queries" -eq 0 ]; then
   # Nothing was asked, so nothing was refused. Says nothing about the limit.
   verdict="NO SIGNAL (no comment query fired; sampled posts may be complete already)"
 else
-  # Queries went out, came back without an error, and carried no comments. Not a
-  # rate limit -- worth a look at the payloads before assuming anything.
-  verdict="ODD ($comment_queries comment queries, no refusals, no comments)"
+  # Queries went out, came back without an error, and carried no comments. Near
+  # the end of a pass that is the expected answer, not an odd one: the queue is
+  # then all residue -- posts already swept, a few hidden comments short -- and
+  # re-opening them gains nothing by definition. On 2026-10-09 this branch logged
+  # ODD for an open window and auto-resume never fired, because a residue-only
+  # queue can never produce new comments and so could never say CLEAR.
+  # So: if every post this probe opened had been opened before, call it clear.
+  # A fresh post coming back empty is still ODD -- resuming on that could retire
+  # real posts on a broken night.
+  sampled=$(q "select count(*) from comment_sweeps where last_attempt >= $probe_started")
+  fresh=$(q "select count(*) from comment_sweeps where last_attempt >= $probe_started and attempts <= 1")
+  if [ "$sampled" -gt 0 ] && [ "$fresh" -eq 0 ]; then
+    verdict="CLEAR ($comment_queries comment queries, no refusals; $sampled sampled posts were residue) -- safe to resume"
+  else
+    verdict="ODD ($comment_queries comment queries, no refusals, no comments; $fresh of $sampled sampled posts were fresh)"
+  fi
 fi
 
 echo "$(date -Is)  rc=$rc raw=+$(( after_raw - before_raw )) comments=+$new_comments  $verdict" >> "$LOG"
