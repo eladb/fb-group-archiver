@@ -17,7 +17,7 @@ LOG="$LOG_DIR/comments-service.log"
 [ -e "$MARKER" ] && exit 0                      # already told them
 systemctl --user is-active --quiet pandas-comments.service && exit 0  # still running
 
-COMMENTS=$(sqlite3 "file:$HOME/pandas/archive/archive.db?mode=ro" \
+COMMENTS=$(sqlite3 "file:$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/archive/archive.db?mode=ro" \
   "select count(*) from comments" 2>/dev/null || echo "?")
 
 # Only this run's lines: everything after the last startup banner. Grepping the
