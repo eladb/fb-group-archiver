@@ -710,6 +710,12 @@ def cmd_backfill(args) -> None:
                                 break
                         else:
                             stale = 0
+                except RateLimited:
+                    # As in the comments pass: the blanket catch below would log
+                    # the refusal and go on, marking this window and every later
+                    # one swept with nothing in them for as long as the limit
+                    # holds. Raising leaves the window unrecorded and exits 3.
+                    raise
                 except Exception as exc:
                     log(f"  {key} q={term}: {str(exc)[:100]}")
                 time.sleep(jitter(args.delay_min, args.delay_max))
