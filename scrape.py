@@ -192,6 +192,11 @@ def graphql_errors(payload):
 RATE_LIMIT_SEEN = []
 
 
+def mostly_failed(failed: int, attempted: int) -> bool:
+    """Whether a backfill window's searches failed too often to record it."""
+    return attempted > 0 and failed * 2 > attempted
+
+
 class RateLimited(Exception):
     """Facebook refused the query for rate reasons. Backing off is the only fix;
     re-authenticating does nothing, and retrying immediately makes it worse."""
@@ -682,6 +687,7 @@ def cmd_backfill(args) -> None:
         log(f"{len(windows)} windows of {args.window_days}d from {start} to {end}; "
             f"{len(done)} already swept")
 
+        unrecorded_in_a_row = 0
         for w_start, w_end in windows:
             key = f"{w_start}:{w_end}"
             if key in done:
@@ -692,9 +698,11 @@ def cmd_backfill(args) -> None:
 
             filt = search_filter(w_start, w_end)
             seen_before = store.db.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
+            attempted = failed = 0
             for term in terms:
                 if deadline and time.time() > deadline:
                     break
+                attempted += 1
                 url = (f"https://www.facebook.com/groups/{group_id}/search/"
                        f"?q={urllib.parse.quote(term)}&filters={filt}")
                 try:
@@ -717,10 +725,23 @@ def cmd_backfill(args) -> None:
                     # holds. Raising leaves the window unrecorded and exits 3.
                     raise
                 except Exception as exc:
+                    failed += 1
                     log(f"  {key} q={term}: {str(exc)[:100]}")
                 time.sleep(jitter(args.delay_min, args.delay_max))
 
             gained = store.db.execute("SELECT COUNT(*) FROM posts").fetchone()[0] - seen_before
+            if mostly_failed(failed, attempted):
+                # A dead browser or a dropped network fails every search, and
+                # recording the window anyway marked 155 weeks swept with
+                # nothing in them on 2026-10-23. Leave it for the next run.
+                log(f"  {key}: NOT recorded, {failed}/{attempted} searches failed "
+                    f"(+{gained} new posts kept)")
+                unrecorded_in_a_row += 1
+                if unrecorded_in_a_row >= 3:
+                    log("3 windows in a row failed; stopping (exit 4)")
+                    sys.exit(4)
+                continue
+            unrecorded_in_a_row = 0
             done.add(key)
             store.set_state("backfill_windows", json.dumps(sorted(done)))
             store.commit()
