@@ -730,6 +730,14 @@ def cmd_backfill(args) -> None:
                 time.sleep(jitter(args.delay_min, args.delay_max))
 
             gained = store.db.execute("SELECT COUNT(*) FROM posts").fetchone()[0] - seen_before
+            if not is_logged_in(ctx):
+                # Logged out, search still answers, with nothing: no search
+                # fails, so mostly_failed() cannot see it. On 2026-10-24 a
+                # session lost overnight returned 6 and then 0 posts for weeks
+                # that hold over a hundred. Check before recording each window.
+                log(f"  {key}: NOT recorded, session logged out "
+                    f"(+{gained} new posts kept); run `scrape.py login` (exit 5)")
+                sys.exit(5)
             if mostly_failed(failed, attempted):
                 # A dead browser or a dropped network fails every search, and
                 # recording the window anyway marked 155 weeks swept with
