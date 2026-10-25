@@ -191,6 +191,13 @@ def graphql_errors(payload):
 
 RATE_LIMIT_SEEN = []
 
+# Side queries whose rate-limit refusal the backfill notes and goes past. Facebook
+# fires this one on every page; on 2026-10-25 it was refused after about a week of
+# searching, three times running, while the searches themselves kept answering.
+# A refused search still stops the run (exit 3): only these are passed over.
+BACKFILL_IGNORED_LIMITS = frozenset({"FBYRPTimeLimitsEnforcementQuery"})
+IGNORED_LIMITS_SEEN = []
+
 
 def mostly_failed(failed: int, attempted: int) -> bool:
     """Whether a backfill window's searches failed too often to record it."""
@@ -202,7 +209,7 @@ class RateLimited(Exception):
     re-authenticating does nothing, and retrying immediately makes it worse."""
 
 
-def check_for_refusal(payload, friendly=""):
+def check_for_refusal(payload, friendly="", ignore=frozenset()):
     """Raise on a rate-limit refusal, and return other errors for logging.
 
     Deliberately loud and deliberately fatal for rate limits. A silent
@@ -214,6 +221,9 @@ def check_for_refusal(payload, friendly=""):
         return []
     for code, msg, sev in errs:
         if code in RATE_LIMIT_CODES or "rate limit" in msg.lower():
+            if friendly in ignore:
+                IGNORED_LIMITS_SEEN.append((friendly, code))
+                continue
             RATE_LIMIT_SEEN.append((friendly, code, msg))
             raise RateLimited(
                 f"{friendly or 'query'}: {msg} (code {code}, {sev}). "
@@ -222,13 +232,16 @@ def check_for_refusal(payload, friendly=""):
     return errs
 
 
-def ingest(store: Store, capture: Capture, group_id: str, known: set) -> int:
+def ingest(store: Store, capture: Capture, group_id: str, known: set,
+           ignore_limits=frozenset()) -> int:
     """Persist everything captured so far. Returns the count of new posts."""
     new_posts = 0
     for url, friendly, payload in capture.drain():
         raw_ref = store.append_raw(url, friendly, payload)
         # Raw is stored first, so the evidence survives even when we abort.
-        for code, msg, sev in check_for_refusal(payload, friendly):
+        for code, msg, sev in check_for_refusal(payload, friendly, ignore_limits):
+            if friendly in ignore_limits:
+                continue
             print(f"  graphql error on {friendly}: {msg} (code {code}, {sev})",
                   flush=True)
         posts, comments = harvest(payload, group_id, raw_ref)
@@ -699,6 +712,7 @@ def cmd_backfill(args) -> None:
             filt = search_filter(w_start, w_end)
             seen_before = store.db.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
             attempted = failed = 0
+            side_limits_before = len(IGNORED_LIMITS_SEEN)
             for term in terms:
                 if deadline and time.time() > deadline:
                     break
@@ -712,7 +726,8 @@ def cmd_backfill(args) -> None:
                     for _ in range(args.max_scrolls):
                         page.mouse.wheel(0, 5000)
                         page.wait_for_timeout(int(jitter(1.8, 3.2) * 1000))
-                        if ingest(store, capture, group_id, set()) == 0:
+                        if ingest(store, capture, group_id, set(),
+                                  BACKFILL_IGNORED_LIMITS) == 0:
                             stale += 1
                             if stale >= 3:
                                 break
@@ -753,7 +768,9 @@ def cmd_backfill(args) -> None:
             done.add(key)
             store.set_state("backfill_windows", json.dumps(sorted(done)))
             store.commit()
-            log(f"  {key}: +{gained} new posts (total {store.counts()['posts']})")
+            side = len(IGNORED_LIMITS_SEEN) - side_limits_before
+            note = f"; {side} side-query rate limits passed over" if side else ""
+            log(f"  {key}: +{gained} new posts (total {store.counts()['posts']}){note}")
             time.sleep(jitter(args.delay_min, args.delay_max) * 2)
 
         log(f"backfill pass done: {store.counts()}")

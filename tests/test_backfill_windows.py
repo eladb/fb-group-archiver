@@ -37,3 +37,32 @@ def test_no_searches_attempted_is_not_a_failure():
     # A time budget can end the window before any search; the existing
     # behaviour (record it) is left alone.
     assert not scrape.mostly_failed(0, 0)
+
+
+def _refused(code=1675004):
+    return {"errors": [{"code": code, "message": "Rate limit exceeded", "severity": "CRITICAL"}]}
+
+
+def test_a_refused_side_query_is_passed_over_when_ignored():
+    errs = scrape.check_for_refusal(
+        _refused(), "FBYRPTimeLimitsEnforcementQuery", scrape.BACKFILL_IGNORED_LIMITS)
+    assert errs and errs[0][0] == 1675004
+
+
+def test_a_refused_search_still_stops_the_backfill():
+    try:
+        scrape.check_for_refusal(
+            _refused(), "SearchCometResultsPaginatedResultsQuery",
+            scrape.BACKFILL_IGNORED_LIMITS)
+    except scrape.RateLimited:
+        return
+    raise AssertionError("a refused search must raise RateLimited")
+
+
+def test_the_side_query_still_stops_other_passes():
+    # The comments pass and the feed crawl pass no ignore set.
+    try:
+        scrape.check_for_refusal(_refused(), "FBYRPTimeLimitsEnforcementQuery")
+    except scrape.RateLimited:
+        return
+    raise AssertionError("without an ignore set every refusal must raise")
