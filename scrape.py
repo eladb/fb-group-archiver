@@ -191,11 +191,15 @@ def graphql_errors(payload):
 
 RATE_LIMIT_SEEN = []
 
-# Side queries whose rate-limit refusal the backfill notes and goes past. Facebook
-# fires this one on every page; on 2026-10-25 it was refused after about a week of
-# searching, three times running, while the searches themselves kept answering.
-# A refused search still stops the run (exit 3): only these are passed over.
-BACKFILL_IGNORED_LIMITS = frozenset({"FBYRPTimeLimitsEnforcementQuery"})
+# Side queries whose rate-limit refusal the backfill and comments passes note and
+# go past. Facebook fires both on every page (the time-limits check and the search
+# bar's setup); on 2026-10-25 each was refused repeatedly while the group search
+# kept answering, and the second stopped a comments pass on its first page. A
+# refusal of any query a pass actually needs still stops it (exit 3).
+BACKFILL_IGNORED_LIMITS = frozenset({
+    "FBYRPTimeLimitsEnforcementQuery",
+    "CometSearchBootstrapKeywordsDataSourceQuery",
+})
 IGNORED_LIMITS_SEEN = []
 
 

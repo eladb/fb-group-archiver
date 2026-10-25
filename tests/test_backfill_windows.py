@@ -66,3 +66,10 @@ def test_the_side_query_still_stops_other_passes():
     except scrape.RateLimited:
         return
     raise AssertionError("without an ignore set every refusal must raise")
+
+
+def test_the_search_bar_setup_query_is_passed_over_too():
+    errs = scrape.check_for_refusal(
+        _refused(), "CometSearchBootstrapKeywordsDataSourceQuery",
+        scrape.BACKFILL_IGNORED_LIMITS)
+    assert errs and errs[0][0] == 1675004
