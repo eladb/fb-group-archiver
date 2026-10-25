@@ -483,6 +483,7 @@ def cmd_comments(args) -> None:
         log(f"{len(rows)} posts with unfetched comments")
 
         short_circuited = 0
+        failed_in_a_row = 0
         for i, row in enumerate(rows, 1):
             if args.max_posts and i > args.max_posts:
                 break
@@ -500,7 +501,10 @@ def cmd_comments(args) -> None:
                 fresh = 0
                 for url, friendly, payload in capture.drain():
                     raw_ref = store.append_raw(url, friendly, payload)
-                    for code, msg, sev in check_for_refusal(payload, friendly):
+                    for code, msg, sev in check_for_refusal(
+                            payload, friendly, BACKFILL_IGNORED_LIMITS):
+                        if friendly in BACKFILL_IGNORED_LIMITS:
+                            continue
                         print(f"  graphql error on {friendly}: {msg} "
                               f"(code {code}, {sev})", flush=True)
                     posts, comments = harvest(payload, group_id, raw_ref)
@@ -515,6 +519,7 @@ def cmd_comments(args) -> None:
                             store.enqueue_media(att["url"], c["post_id"], att["kind"])
                 return fresh
 
+            opening_failed = False
             try:
                 page.goto(row["url"], wait_until="domcontentloaded")
                 page.wait_for_timeout(int(jitter(2.0, 4.0) * 1000))
@@ -587,9 +592,30 @@ def cmd_comments(args) -> None:
                 # fix managed to detect the refusal and then discard it.
                 raise
             except Exception as exc:
+                opening_failed = True
                 log(f"  {row['id']}: {str(exc)[:120]}")
 
             absorb()
+            # A sweep that gains nothing counts toward retiring the post, so a
+            # logged-out session or a dead browser must not record one: either
+            # would retire every post it touched (the backfill lost 155 weeks
+            # this way on 2026-10-23, and a logout cost two more on the 24th).
+            if not is_logged_in(ctx):
+                log(f"  {row['id']}: NOT recorded, session logged out; "
+                    f"run `scrape.py login` (exit 5)")
+                store.commit()
+                sys.exit(5)
+            if opening_failed:
+                failed_in_a_row += 1
+                log(f"  {row['id']}: NOT recorded, opening failed")
+                if failed_in_a_row >= 3:
+                    store.commit()
+                    log("3 posts in a row failed to open; stopping (exit 4)")
+                    sys.exit(4)
+                store.commit()
+                time.sleep(jitter(args.delay_min, args.delay_max))
+                continue
+            failed_in_a_row = 0
             have_after = store.db.execute(
                 "SELECT COUNT(*) FROM comments WHERE post_id=?", (row["id"],)
             ).fetchone()[0]
